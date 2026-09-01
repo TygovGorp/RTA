@@ -4,7 +4,7 @@
 
 #include "Modules/ModuleManager.h"
 
-class FRaytraced_AudioModule : public IModuleInterface
+class FRaytracedAudioModule : public IModuleInterface
 {
 public:
 

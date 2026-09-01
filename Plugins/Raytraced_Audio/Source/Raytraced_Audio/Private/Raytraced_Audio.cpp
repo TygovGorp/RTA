@@ -4,12 +4,12 @@
 
 #define LOCTEXT_NAMESPACE "FRaytraced_AudioModule"
 
-void FRaytraced_AudioModule::StartupModule()
+void FRaytracedAudioModule::StartupModule()
 {
 	// This code will execute after your module is loaded into memory; the exact timing is specified in the .uplugin file per-module
 }
 
-void FRaytraced_AudioModule::ShutdownModule()
+void FRaytracedAudioModule::ShutdownModule()
 {
 	// This function may be called during shutdown to clean up your module.  For modules that support dynamic reloading,
 	// we call this function before unloading the module.
@@ -17,4 +17,4 @@ void FRaytraced_AudioModule::ShutdownModule()
 
 #undef LOCTEXT_NAMESPACE
 	
-IMPLEMENT_MODULE(FRaytraced_AudioModule, Raytraced_Audio)
+IMPLEMENT_MODULE(FRaytracedAudioModule, Raytraced_Audio)
