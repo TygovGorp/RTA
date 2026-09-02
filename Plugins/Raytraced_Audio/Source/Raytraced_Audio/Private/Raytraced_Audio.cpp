@@ -1,5 +1,3 @@
-// Copyright Epic Games, Inc. All Rights Reserved.
-
 #include "Raytraced_Audio.h"
 
 #define LOCTEXT_NAMESPACE "FRaytraced_AudioModule"
@@ -7,6 +5,13 @@
 void FRaytracedAudioModule::StartupModule()
 {
 	// This code will execute after your module is loaded into memory; the exact timing is specified in the .uplugin file per-module
+	
+	IModularFeatures::Get().RegisterModularFeature(
+		IAudioSpatializationFactory::GetModularFeatureName(), &SpatializationFactory);
+	IModularFeatures::Get().RegisterModularFeature(
+		IAudioOcclusionFactory::GetModularFeatureName(), &OcclusionFactory);
+	IModularFeatures::Get().RegisterModularFeature(
+		IAudioReverbFactory::GetModularFeatureName(), &ReverbFactory);
 }
 
 void FRaytracedAudioModule::ShutdownModule()

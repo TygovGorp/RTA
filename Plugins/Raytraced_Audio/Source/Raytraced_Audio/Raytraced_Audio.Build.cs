@@ -25,7 +25,7 @@ public class Raytraced_Audio : ModuleRules
 		PublicDependencyModuleNames.AddRange(
 			new string[]
 			{
-				"Core",
+				"Core", "CoreUObject", "Engine", "AudioExtensions", "AudioMixer"
 				// ... add other public dependencies that you statically link with here ...
 			}
 			);
@@ -34,8 +34,6 @@ public class Raytraced_Audio : ModuleRules
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
 			{
-				"CoreUObject",
-				"Engine",
 				"Slate",
 				"SlateCore",
 				// ... add private dependencies that you statically link with here ...	
