@@ -1,9 +1,13 @@
 ﻿#pragma once
 #include "IAudioExtensionPlugin.h"
+#include "RaytraceManager.h"
 
 class FRaytracedOcclusion : public IAudioOcclusion
 {
 public:
+	FRaytracedOcclusion(const TSharedPtr<FRaytraceManager>& Manager) : RTManager(Manager)
+	{}
+	
 	/** Initialize the occlusion plugin with the same rate and number of sources. */
 	virtual void Initialize(const FAudioPluginInitializationParams InitializationParams) override;
 	
@@ -20,4 +24,7 @@ public:
 
 	/** Processes audio with the given input and output data structs.*/
 	virtual void ProcessAudio(const FAudioPluginSourceInputData& InputData, FAudioPluginSourceOutputData& OutputData) override;
+	
+private:
+	TSharedPtr<FRaytraceManager> RTManager;
 };

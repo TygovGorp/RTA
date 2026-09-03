@@ -1,13 +1,27 @@
 ﻿#pragma once
+#include "AudioDevice.h"
 #include "RaytracedReverb.h"
+#include "RaytraceManager.h"
 
 class FRaytracedReverbFactory : public IAudioReverbFactory
 {
 public:
-	virtual FString GetDisplayName() override { return TEXT("MyRaytraceReverb"); }
+	FString GetDisplayName() override { return TEXT("MyRaytraceReverb"); }
 	virtual bool SupportsPlatform(const FString& PlatformName) override { return true; }
 	virtual TAudioReverbPtr CreateNewReverbPlugin(FAudioDevice* OwningDevice) override
 	{
-		return MakeShared<FRaytracedReverb>();
+		TSharedPtr<FRaytraceManager>* Existing = RTManagerMapPtr->Find(OwningDevice);
+		TSharedPtr<FRaytraceManager> Manager = Existing ? *Existing : RTManagerMapPtr->Add(OwningDevice, MakeShared<FRaytraceManager>());
+		
+		OwningDevice->RegisterPluginListener(AudioPluginListenerPtr);
+		
+		return MakeShared<FRaytracedReverb>(Manager);
 	}
+	
+	void SetAudioPluginListenerPtr(TAudioPluginListenerPtr Ptr) { AudioPluginListenerPtr = Ptr; }
+	void SetRTManagerMapPtr(TMap<FAudioDevice*, TSharedPtr<FRaytraceManager>>* Ptr) { RTManagerMapPtr = Ptr; }
+	
+private:
+	TAudioPluginListenerPtr AudioPluginListenerPtr = nullptr;
+	TMap<FAudioDevice*, TSharedPtr<FRaytraceManager>>* RTManagerMapPtr = nullptr;
 };

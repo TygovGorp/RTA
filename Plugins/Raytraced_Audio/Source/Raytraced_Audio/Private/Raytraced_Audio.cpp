@@ -5,11 +5,23 @@
 void FRaytracedAudioModule::StartupModule()
 {
 	// This code will execute after your module is loaded into memory; the exact timing is specified in the .uplugin file per-module
+	UE_LOG(LogTemp, Log, TEXT("RTA: Started"));
+	
+	
+	AudioPluginListener = MakeShared<FAudioPluginListener>();
+	AudioPluginListener->SetRTManagerMapPtr(&RTManagerMap);
+	
+	OcclusionFactory.SetRTManagerMapPtr(&RTManagerMap);
+	OcclusionFactory.SetAudioPluginListenerPtr(AudioPluginListener);
+	
+	ReverbFactory.SetRTManagerMapPtr(&RTManagerMap);
+	ReverbFactory.SetAudioPluginListenerPtr(AudioPluginListener);
 	
 	IModularFeatures::Get().RegisterModularFeature(
 		IAudioOcclusionFactory::GetModularFeatureName(), &OcclusionFactory);
 	IModularFeatures::Get().RegisterModularFeature(
 		IAudioReverbFactory::GetModularFeatureName(), &ReverbFactory);
+	
 }
 
 void FRaytracedAudioModule::ShutdownModule()

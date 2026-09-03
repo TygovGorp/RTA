@@ -8,10 +8,6 @@ void FRaytracedReverb::Shutdown()
 {
 }
 
-void FRaytracedReverb::OnDeviceShutdown(FAudioDevice* /*AudioDevice*/)
-{
-}
-
 void FRaytracedReverb::OnInitSource(const uint32 /*SourceId*/, const FName& /*AudioComponentUserId*/, const uint32 /*NumChannels*/,
 	UReverbPluginSourceSettingsBase* /*InSettings*/)
 {

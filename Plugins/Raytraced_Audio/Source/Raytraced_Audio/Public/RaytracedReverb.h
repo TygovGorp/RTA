@@ -1,9 +1,13 @@
 ﻿#pragma once
 #include "IAudioExtensionPlugin.h"
+#include "RaytraceManager.h"
 
 class FRaytracedReverb : public IAudioReverb
 {
 public:
+	FRaytracedReverb(const TSharedPtr<FRaytraceManager>& Manager): RTManager(Manager)
+	{}
+	
 	/** Initialize the reverb plugin with the same rate and number of sources. */
 	virtual void Initialize(const FAudioPluginInitializationParams InitializationParams) override;
 	
@@ -11,8 +15,6 @@ public:
 	* Shuts down the audio plugin.
 	*/
 	virtual void Shutdown() override;
-
-	virtual void OnDeviceShutdown(FAudioDevice* AudioDevice) override;
 
 	/** Called when a source is assigned to a voice. */
 	virtual void OnInitSource(const uint32 SourceId, const FName& AudioComponentUserId, const uint32 NumChannels, UReverbPluginSourceSettingsBase* InSettings) override;
@@ -33,4 +35,7 @@ public:
 
 	/** Processes audio with the given input and output data structs.*/
 	virtual void ProcessSourceAudio(const FAudioPluginSourceInputData& InputData, FAudioPluginSourceOutputData& OutputData) override;
+	
+private:
+	TSharedPtr<FRaytraceManager> RTManager;
 };
