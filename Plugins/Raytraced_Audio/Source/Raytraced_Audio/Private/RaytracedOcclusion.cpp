@@ -27,7 +27,7 @@ void FRaytracedOcclusion::ProcessAudio(const FAudioPluginSourceInputData& InputD
 	RTManager->UpdateEmitterPosition(InputData.SourceId, InputData.SpatializationParams->EmitterWorldPosition);
 	RTManager->UpdateListenerPosition(InputData.SourceId, InputData.SpatializationParams->ListenerPosition);
 	auto Results = RTManager->GetLatestResults(InputData.SourceId);
-
+	
 	const float Gain = 1.0f - Results.DirectTransmissionLoss; 
 
 	const int32 NumSamples = InputData.AudioBuffer->Num();
