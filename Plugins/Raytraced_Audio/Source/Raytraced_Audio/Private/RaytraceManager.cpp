@@ -135,7 +135,7 @@ bool FRaytraceManager::TickReverb(float DeltaTime)
 }
 
 void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
-{	
+{
     if (SourceIds.Num() == 0) return;
 
     FVector ListenerPos;
@@ -151,19 +151,62 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
         RayData->Lock.ReadUnlock();
     }
 	
+    TArray<FVector> EmitterPositions;
+    EmitterPositions.SetNumZeroed(SourceIds.Num());
+    TArray<bool> bDirectLOS;
+    bDirectLOS.Init(false, SourceIds.Num());
+
+    float BatchMaxDistance = 0.f;
+
+    for (int32 SrcIdx = 0; SrcIdx < SourceIds.Num(); ++SrcIdx)
+    {
+        ResultsLock.ReadLock();
+        auto RayDataEntry = Results.Find(SourceIds[SrcIdx]);
+        if (!RayDataEntry) { ResultsLock.ReadUnlock(); continue; }
+        TSharedPtr<FSourceRayData> RayData = *RayDataEntry;
+        ResultsLock.ReadUnlock();
+
+        RayData->Lock.ReadLock();
+        FVector EmitterPosition = RayData->EmitterPosition;
+        RayData->Lock.ReadUnlock();
+
+        EmitterPositions[SrcIdx] = EmitterPosition;
+        BatchMaxDistance = FMath::Max(BatchMaxDistance, FVector::Dist(ListenerPos, EmitterPosition));
+    	
+        FHitResult DirectHit;
+        bool bBlocked = World->LineTraceSingleByChannel(DirectHit, ListenerPos, EmitterPosition, ECC_Visibility);
+        bDirectLOS[SrcIdx] = !bBlocked;
+    }
+
+    const float DynamicMaxRayLength = FMath::Max(MaxRayLength, BatchMaxDistance * 5.5f);
+
     TArray<float> LocalAccumulatedLoss;
     LocalAccumulatedLoss.SetNumZeroed(SourceIds.Num());
     TArray<int32> LocalSuccessCount;
     LocalSuccessCount.SetNumZeroed(SourceIds.Num());
+	
+    for (int32 SrcIdx = 0; SrcIdx < SourceIds.Num(); ++SrcIdx)
+    {
+        if (bDirectLOS[SrcIdx])
+        {
+            LocalSuccessCount[SrcIdx] = OcclusionRayCount;
+        }
+    }
 
     for (int RayNum = 0; RayNum < OcclusionRayCount; ++RayNum)
     {
         FVector startPos = ListenerPos;
         bool bHasHitSurface = false;
         FVector LastHitNormal = FVector::ZeroVector;
-    	
+
         TArray<bool> bConnected;
         bConnected.Init(false, SourceIds.Num());
+
+        // Sources already resolved by the direct check don't need any stochastic work this ray.
+        for (int32 SrcIdx = 0; SrcIdx < SourceIds.Num(); ++SrcIdx)
+        {
+            bConnected[SrcIdx] = bDirectLOS[SrcIdx];
+        }
 
         for (int Depth = 0; Depth < OcclusionMaxDepth; ++Depth)
         {
@@ -173,7 +216,7 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
                 ? RandomCosineWeightedHemisphere(LastHitNormal)
                 : FMath::VRand();
 
-            FVector TraceEnd = SegmentStart + RandomDir * MaxRayLength;
+            FVector TraceEnd = SegmentStart + RandomDir * DynamicMaxRayLength;
 
             FHitResult HitResult;
             bool bHit = World->LineTraceSingleByChannel(HitResult, SegmentStart, TraceEnd, ECC_Visibility);
@@ -193,16 +236,7 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
                 if (bConnected[SrcIdx])
                     continue;
 
-                uint32 SourceId = SourceIds[SrcIdx];
-                ResultsLock.ReadLock();
-                auto RayDataEntry = Results.Find(SourceId);
-                if (!RayDataEntry) { ResultsLock.ReadUnlock(); continue; }
-                TSharedPtr<FSourceRayData> RayData = *RayDataEntry;
-                ResultsLock.ReadUnlock();
-
-                RayData->Lock.ReadLock();
-                FVector EmitterPosition = RayData->EmitterPosition;
-                RayData->Lock.ReadUnlock();
+                const FVector& EmitterPosition = EmitterPositions[SrcIdx];
 
                 FHitResult NEEHitResult;
                 bool bNEEHit = World->LineTraceSingleByChannel(NEEHitResult, startPos, EmitterPosition, ECC_Visibility);
@@ -217,7 +251,7 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
             }
         }
     }
-	
+
     constexpr float SmoothingAlpha = 0.15f; // tune: lower = smoother/slower, higher = snappier/more jitter
     for (int32 SrcIdx = 0; SrcIdx < SourceIds.Num(); ++SrcIdx)
     {
@@ -231,21 +265,21 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
         float TotalLoss = LocalAccumulatedLoss[SrcIdx] + (OcclusionRayCount - LocalSuccessCount[SrcIdx]) * 1.f;
         float NewEstimate = TotalLoss / float(OcclusionRayCount);
 
-    	RayData->Lock.WriteLock();
-    	if (!RayData->bHasValidEstimate)
-    	{
-    		RayData->DirectTransmissionLoss = NewEstimate;
-    		RayData->bHasValidEstimate = true;
-    	}
-    	else
-    	{
-    		float PreviousLoss = RayData->DirectTransmissionLoss;
-    		RayData->DirectTransmissionLoss = FMath::Lerp(PreviousLoss, NewEstimate, SmoothingAlpha);
-    	}
-    	
-    	UE_LOG(LogTemp, Log, TEXT("RTA: SourceId=%u Loss=%.2f"), SourceIds[SrcIdx], RayData->DirectTransmissionLoss);
-    	
-    	RayData->Lock.WriteUnlock();
+        RayData->Lock.WriteLock();
+        if (!RayData->bHasValidEstimate)
+        {
+            RayData->DirectTransmissionLoss = NewEstimate;
+            RayData->bHasValidEstimate = true;
+        }
+        else
+        {
+            float PreviousLoss = RayData->DirectTransmissionLoss;
+            RayData->DirectTransmissionLoss = FMath::Lerp(PreviousLoss, NewEstimate, SmoothingAlpha);
+        }
+
+        UE_LOG(LogTemp, Log, TEXT("RTA: SourceId=%u Loss=%.2f"), SourceIds[SrcIdx], RayData->DirectTransmissionLoss);
+
+        RayData->Lock.WriteUnlock();
     }
 }
 
