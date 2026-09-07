@@ -32,6 +32,10 @@ public:
 			ListenerPosition       = Input.ListenerPosition;
 			DirtyOcclusion         = Input.DirtyOcclusion;
 			DirtyReverb            = Input.DirtyReverb;
+			AirAbsorptionMinDistance         = Input.AirAbsorptionMinDistance;
+			AirAbsorptionMaxDistance         = Input.AirAbsorptionMaxDistance;
+			AirAbsorptionCutoffAtMinDistance = Input.AirAbsorptionCutoffAtMinDistance;
+			AirAbsorptionCutoffAtMaxDistance = Input.AirAbsorptionCutoffAtMaxDistance;
 		}
 		
 		FRWLock Lock;
@@ -45,6 +49,15 @@ public:
 		FVector EmitterPosition = FVector(0);
 		FVector ListenerPosition = FVector(0);
 		//TArray<FBouncePathResult> ReverbPaths; // hit points/materials from bounce rays
+
+		// Per-source air absorption config, set once at RegisterSource from the sound's
+		// URTAOcclusionSourceSettings. Mirrors native Sound Attenuation's Air Absorption
+		// panel semantics (min/max distance range, cutoff at each end) so it's familiar
+		// to designers, without reading the native asset directly (see design note).
+		float AirAbsorptionMinDistance = 300.f;
+		float AirAbsorptionMaxDistance = 5000.f;
+		float AirAbsorptionCutoffAtMinDistance = 20000.f;
+		float AirAbsorptionCutoffAtMaxDistance = 2000.f;
 		
 		bool DirtyOcclusion = true;
 		bool DirtyReverb	= true;
@@ -52,7 +65,11 @@ public:
 	FRaytraceManager();
 	~FRaytraceManager();
 
-	void RegisterSource(uint32 SourceId);
+	void RegisterSource(uint32 SourceId,
+		float AirAbsorptionMinDistance = 300.f,
+		float AirAbsorptionMaxDistance = 5000.f,
+		float AirAbsorptionCutoffAtMinDistance = 20000.f,
+		float AirAbsorptionCutoffAtMaxDistance = 2000.f);
 	void UnregisterSource(uint32 SourceId);
 	void UpdateEmitterPosition(uint32 SourceId, const FVector& Position); 
 	void UpdateListenerPosition(uint32 SourceId, const FVector& Position); 
@@ -62,7 +79,8 @@ public:
 private:
 	bool TickOcclusion(float DeltaTime);
 	bool TickReverb(float DeltaTime);
-	
+	TSharedPtr<FSourceRayData> FindSourceRayData(uint32 SourceId);
+
 	void RunOcclusionTrace(const TArray<uint32>& SourceIds);   // scheduled frequently
 	void RunReverbTraces(uint32 SourceId);     // scheduled less frequently
 	
@@ -80,4 +98,3 @@ private:
 	TMap<uint32, TSharedPtr<FSourceRayData>> Results; 
 	FRWLock ResultsLock;
 };
-

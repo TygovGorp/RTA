@@ -18,12 +18,21 @@ FRaytraceManager::~FRaytraceManager()
 	FTSTicker::GetCoreTicker().RemoveTicker(ReverbDelegateHandle);
 }
 
-void FRaytraceManager::RegisterSource(uint32 SourceId)
+void FRaytraceManager::RegisterSource(uint32 SourceId,
+	float AirAbsorptionMinDistance,
+	float AirAbsorptionMaxDistance,
+	float AirAbsorptionCutoffAtMinDistance,
+	float AirAbsorptionCutoffAtMaxDistance)
 {
-	
+	TSharedPtr<FSourceRayData> NewData = MakeShared<FSourceRayData>();
+	NewData->AirAbsorptionMinDistance = AirAbsorptionMinDistance;
+	NewData->AirAbsorptionMaxDistance = AirAbsorptionMaxDistance;
+	NewData->AirAbsorptionCutoffAtMinDistance = AirAbsorptionCutoffAtMinDistance;
+	NewData->AirAbsorptionCutoffAtMaxDistance = AirAbsorptionCutoffAtMaxDistance;
+
 	this->ResultsLock.WriteLock();
 	if (Results.Find(SourceId) != nullptr) UE_LOG(LogTemp, Warning, TEXT("RTA: SourceId already present in Results Map"));
-	this->Results.Add(SourceId, MakeShared<FSourceRayData>());
+	this->Results.Add(SourceId, NewData);
 	this->ResultsLock.WriteUnlock();
 }
 
@@ -134,152 +143,150 @@ bool FRaytraceManager::TickReverb(float DeltaTime)
 	return true;
 }
 
+TSharedPtr<FRaytraceManager::FSourceRayData> FRaytraceManager::FindSourceRayData(uint32 SourceId)
+{
+    FReadScopeLock Lock(ResultsLock);
+    TSharedPtr<FSourceRayData>* Entry = Results.Find(SourceId);
+    return Entry ? *Entry : nullptr;
+}
+
 void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
 {
     if (SourceIds.Num() == 0) return;
 
+    TSharedPtr<FSourceRayData> ListenerData = FindSourceRayData(SourceIds[0]);
+    if (!ListenerData) return;
+
     FVector ListenerPos;
     {
-        ResultsLock.ReadLock();
-        auto RayDataEntry = Results.Find(SourceIds[0]);
-        if (!RayDataEntry) { ResultsLock.ReadUnlock(); return; }
-        TSharedPtr<FSourceRayData> RayData = *RayDataEntry;
-        ResultsLock.ReadUnlock();
-
-        RayData->Lock.ReadLock();
-        ListenerPos = RayData->ListenerPosition;
-        RayData->Lock.ReadUnlock();
+        FReadScopeLock Lock(ListenerData->Lock);
+        ListenerPos = ListenerData->ListenerPosition;
     }
 	
+    TArray<TSharedPtr<FSourceRayData>> ValidSourceData;
+    TArray<uint32> ValidSourceIds;
     TArray<FVector> EmitterPositions;
-    EmitterPositions.SetNumZeroed(SourceIds.Num());
     TArray<bool> bDirectLOS;
-    bDirectLOS.Init(false, SourceIds.Num());
-
+    TArray<float> AirAbsorptionCutoffHz;
     float BatchMaxDistance = 0.f;
 
-    for (int32 SrcIdx = 0; SrcIdx < SourceIds.Num(); ++SrcIdx)
+    for (uint32 SourceId : SourceIds)
     {
-        ResultsLock.ReadLock();
-        auto RayDataEntry = Results.Find(SourceIds[SrcIdx]);
-        if (!RayDataEntry) { ResultsLock.ReadUnlock(); continue; }
-        TSharedPtr<FSourceRayData> RayData = *RayDataEntry;
-        ResultsLock.ReadUnlock();
+        TSharedPtr<FSourceRayData> RayData = FindSourceRayData(SourceId);
+        if (!RayData) continue;
 
-        RayData->Lock.ReadLock();
-        FVector EmitterPosition = RayData->EmitterPosition;
-        RayData->Lock.ReadUnlock();
+        FVector EmitterPosition;
+        {
+            FReadScopeLock Lock(RayData->Lock);
+            EmitterPosition = RayData->EmitterPosition;
+        }
 
-        EmitterPositions[SrcIdx] = EmitterPosition;
-        BatchMaxDistance = FMath::Max(BatchMaxDistance, FVector::Dist(ListenerPos, EmitterPosition));
-    	
         FHitResult DirectHit;
-        bool bBlocked = World->LineTraceSingleByChannel(DirectHit, ListenerPos, EmitterPosition, ECC_Visibility);
-        bDirectLOS[SrcIdx] = !bBlocked;
+        const bool bBlocked = World->LineTraceSingleByChannel(DirectHit, ListenerPos, EmitterPosition, ECC_Visibility);
+
+        const float Distance = FVector::Dist(ListenerPos, EmitterPosition);
+
+        // Air absorption: purely distance-driven, independent of occlusion state.
+        // Mirrors native Sound Attenuation's Air Absorption semantics: no effect below
+        // MinDistance, full effect (CutoffAtMaxDistance) at/beyond MaxDistance, lerped
+        // between. Per-source, read from this source's registered settings.
+        float CutoffHz;
+        {
+            FReadScopeLock Lock(RayData->Lock);
+            const float MinDist = RayData->AirAbsorptionMinDistance;
+            const float MaxDist = FMath::Max(RayData->AirAbsorptionMaxDistance, MinDist + KINDA_SMALL_NUMBER);
+            const float Alpha = FMath::Clamp((Distance - MinDist) / (MaxDist - MinDist), 0.f, 1.f);
+            CutoffHz = FMath::Lerp(RayData->AirAbsorptionCutoffAtMinDistance, RayData->AirAbsorptionCutoffAtMaxDistance, Alpha);
+        }
+
+        ValidSourceData.Add(RayData);
+        ValidSourceIds.Add(SourceId);
+        EmitterPositions.Add(EmitterPosition);
+        bDirectLOS.Add(!bBlocked);
+        AirAbsorptionCutoffHz.Add(CutoffHz);
+        BatchMaxDistance = FMath::Max(BatchMaxDistance, Distance);
     }
+
+    const int32 NumSources = ValidSourceData.Num();
+    if (NumSources == 0) return;
 
     const float DynamicMaxRayLength = FMath::Max(MaxRayLength, BatchMaxDistance * 5.5f);
-
-    TArray<float> LocalAccumulatedLoss;
-    LocalAccumulatedLoss.SetNumZeroed(SourceIds.Num());
-    TArray<int32> LocalSuccessCount;
-    LocalSuccessCount.SetNumZeroed(SourceIds.Num());
 	
-    for (int32 SrcIdx = 0; SrcIdx < SourceIds.Num(); ++SrcIdx)
-    {
-        if (bDirectLOS[SrcIdx])
-        {
-            LocalSuccessCount[SrcIdx] = OcclusionRayCount;
-        }
-    }
+    TArray<float> TotalLoss;
+    TotalLoss.Init(0.f, NumSources);
 
-    for (int RayNum = 0; RayNum < OcclusionRayCount; ++RayNum)
+    for (int32 RayNum = 0; RayNum < OcclusionRayCount; ++RayNum)
     {
-        FVector startPos = ListenerPos;
-        bool bHasHitSurface = false;
+        TArray<bool> bConnected = bDirectLOS; // direct-LOS sources start "connected", skip them below
+
+        FVector CurrentPos = ListenerPos;
         FVector LastHitNormal = FVector::ZeroVector;
+        bool bHasHitSurface = false;
 
-        TArray<bool> bConnected;
-        bConnected.Init(false, SourceIds.Num());
-
-        // Sources already resolved by the direct check don't need any stochastic work this ray.
-        for (int32 SrcIdx = 0; SrcIdx < SourceIds.Num(); ++SrcIdx)
+        for (int32 Depth = 0; Depth < OcclusionMaxDepth; ++Depth)
         {
-            bConnected[SrcIdx] = bDirectLOS[SrcIdx];
-        }
-
-        for (int Depth = 0; Depth < OcclusionMaxDepth; ++Depth)
-        {
-            FVector SegmentStart = startPos;
-
-            FVector RandomDir = bHasHitSurface
+            const FVector RandomDir = bHasHitSurface
                 ? RandomCosineWeightedHemisphere(LastHitNormal)
                 : FMath::VRand();
-
-            FVector TraceEnd = SegmentStart + RandomDir * DynamicMaxRayLength;
+            const FVector TraceEnd = CurrentPos + RandomDir * DynamicMaxRayLength;
 
             FHitResult HitResult;
-            bool bHit = World->LineTraceSingleByChannel(HitResult, SegmentStart, TraceEnd, ECC_Visibility);
-            FVector SegmentEnd = bHit ? HitResult.Location : TraceEnd;
-
+            World->LineTraceSingleByChannel(HitResult, CurrentPos, TraceEnd, ECC_Visibility);
             if (!HitResult.IsValidBlockingHit())
                 break;
 
             constexpr float SurfaceBias = 1.f;
-            startPos = HitResult.Location + HitResult.Normal * SurfaceBias;
+            CurrentPos = HitResult.Location + HitResult.Normal * SurfaceBias;
             LastHitNormal = HitResult.Normal;
             bHasHitSurface = true;
 
             // Next Event Estimation
-            for (int32 SrcIdx = 0; SrcIdx < SourceIds.Num(); ++SrcIdx)
+            for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
             {
                 if (bConnected[SrcIdx])
                     continue;
 
-                const FVector& EmitterPosition = EmitterPositions[SrcIdx];
-
                 FHitResult NEEHitResult;
-                bool bNEEHit = World->LineTraceSingleByChannel(NEEHitResult, startPos, EmitterPosition, ECC_Visibility);
+                const bool bNEEHit = World->LineTraceSingleByChannel(
+                    NEEHitResult, CurrentPos, EmitterPositions[SrcIdx], ECC_Visibility);
 
                 if (!bNEEHit)
                 {
-                    float RayLoss = 1.f - (1.f / float(Depth + 1));
-                    LocalAccumulatedLoss[SrcIdx] += RayLoss;
-                    LocalSuccessCount[SrcIdx] += 1;
+                    TotalLoss[SrcIdx] += 1.f - (1.f / float(Depth + 1));
                     bConnected[SrcIdx] = true;
                 }
+            }
+        }
+
+        for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
+        {
+            if (!bConnected[SrcIdx])
+            {
+                TotalLoss[SrcIdx] += 1.f; // never reached this source on this ray: full loss
             }
         }
     }
 
     constexpr float SmoothingAlpha = 0.15f; // tune: lower = smoother/slower, higher = snappier/more jitter
-    for (int32 SrcIdx = 0; SrcIdx < SourceIds.Num(); ++SrcIdx)
+    for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
     {
-        ResultsLock.ReadLock();
-        auto RayDataEntry = Results.Find(SourceIds[SrcIdx]);
-        if (!RayDataEntry) { ResultsLock.ReadUnlock(); continue; }
-        TSharedPtr<FSourceRayData> RayData = *RayDataEntry;
-        ResultsLock.ReadUnlock();
+        const float NewEstimate = TotalLoss[SrcIdx] / float(OcclusionRayCount);
+        TSharedPtr<FSourceRayData>& RayData = ValidSourceData[SrcIdx];
 
-        // Rays that never connected count as full loss (1.0) in the average.
-        float TotalLoss = LocalAccumulatedLoss[SrcIdx] + (OcclusionRayCount - LocalSuccessCount[SrcIdx]) * 1.f;
-        float NewEstimate = TotalLoss / float(OcclusionRayCount);
-
-        RayData->Lock.WriteLock();
+        FWriteScopeLock Lock(RayData->Lock);
         if (!RayData->bHasValidEstimate)
         {
             RayData->DirectTransmissionLoss = NewEstimate;
+            RayData->DirectLowpassCutoffHz = AirAbsorptionCutoffHz[SrcIdx];
             RayData->bHasValidEstimate = true;
         }
         else
         {
-            float PreviousLoss = RayData->DirectTransmissionLoss;
-            RayData->DirectTransmissionLoss = FMath::Lerp(PreviousLoss, NewEstimate, SmoothingAlpha);
+            RayData->DirectTransmissionLoss = FMath::Lerp(RayData->DirectTransmissionLoss, NewEstimate, SmoothingAlpha);
+            RayData->DirectLowpassCutoffHz = FMath::Lerp(RayData->DirectLowpassCutoffHz, AirAbsorptionCutoffHz[SrcIdx], SmoothingAlpha);
         }
 
-        UE_LOG(LogTemp, Log, TEXT("RTA: SourceId=%u Loss=%.2f"), SourceIds[SrcIdx], RayData->DirectTransmissionLoss);
-
-        RayData->Lock.WriteUnlock();
+        UE_LOG(LogTemp, Log, TEXT("RTA: SourceId=%u Loss=%.2f CutoffHz=%.0f"), ValidSourceIds[SrcIdx], RayData->DirectTransmissionLoss, RayData->DirectLowpassCutoffHz);
     }
 }
 

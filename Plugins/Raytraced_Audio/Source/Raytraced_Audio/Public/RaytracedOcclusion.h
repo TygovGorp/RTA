@@ -2,6 +2,11 @@
 #include "IAudioExtensionPlugin.h"
 #include "RaytraceManager.h"
 
+struct FOcclusionFilterState
+{
+	float PrevOutput = 0.f;
+};
+
 class FRaytracedOcclusion : public IAudioOcclusion
 {
 public:
@@ -27,4 +32,8 @@ public:
 	
 private:
 	TSharedPtr<FRaytraceManager> RTManager;
+	float SampleRate = 48000.f;
+
+	TMap<uint32, FOcclusionFilterState> FilterStates;
+	FRWLock FilterStatesLock;
 };
