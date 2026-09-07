@@ -186,10 +186,7 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
 
         const float Distance = FVector::Dist(ListenerPos, EmitterPosition);
 
-        // Air absorption: purely distance-driven, independent of occlusion state.
-        // Mirrors native Sound Attenuation's Air Absorption semantics: no effect below
-        // MinDistance, full effect (CutoffAtMaxDistance) at/beyond MaxDistance, lerped
-        // between. Per-source, read from this source's registered settings.
+        // Air absorption
         float CutoffHz;
         {
             FReadScopeLock Lock(RayData->Lock);
