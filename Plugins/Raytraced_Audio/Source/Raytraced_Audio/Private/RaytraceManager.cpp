@@ -1,5 +1,7 @@
 ﻿#include "RaytraceManager.h"
 
+#include "AcousticMaterialAsset.h"
+
 FRaytraceManager::FRaytraceManager() : World(nullptr)
 {
 	UE_LOG(LogTemp, Log, TEXT("RTA: Create New Manager"))
@@ -211,6 +213,9 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
 	
     TArray<float> TotalLoss;
     TotalLoss.Init(0.f, NumSources);
+	
+	FCollisionQueryParams CollisionQueryParams;
+	CollisionQueryParams.bReturnPhysicalMaterial = true;
 
     for (int32 RayNum = 0; RayNum < OcclusionRayCount; ++RayNum)
     {
@@ -228,9 +233,14 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
             const FVector TraceEnd = CurrentPos + RandomDir * DynamicMaxRayLength;
 
             FHitResult HitResult;
-            World->LineTraceSingleByChannel(HitResult, CurrentPos, TraceEnd, ECC_Visibility);
+            World->LineTraceSingleByChannel(HitResult, CurrentPos, TraceEnd, ECC_Visibility, CollisionQueryParams);
             if (!HitResult.IsValidBlockingHit())
                 break;
+        	
+        	if (const UAcousticPhysicalMaterial* AcousticPhysMat = Cast<UAcousticPhysicalMaterial>(HitResult.PhysMaterial.Get()))
+        	{
+        		//AcousticPhysMat->AcousticMaterial.Get();
+        	}
 
             constexpr float SurfaceBias = 1.f;
             CurrentPos = HitResult.Location + HitResult.Normal * SurfaceBias;
