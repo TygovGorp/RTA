@@ -72,7 +72,7 @@ public:
 	EMountingCondition MountingCondition;
 	UPROPERTY(EditAnywhere, Category = "Transmission")
 	float PanelArea; //m^2
-	UPROPERTY(EditAnywhere, Category = "Data", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	UPROPERTY(EditAnywhere, Category = "Transmission", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float Scattering = 0.5f;
 	
 	//Double Leaf Inputs fields

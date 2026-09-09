@@ -165,12 +165,18 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
         ListenerPos = ListenerData->ListenerPosition;
     }
 
+    struct FBandEnergy { float Bands[3] = { 1.f, 1.f, 1.f }; };
+
     TArray<TSharedPtr<FSourceRayData>> ValidSourceData;
     TArray<uint32> ValidSourceIds;
     TArray<FVector> EmitterPositions;
     TArray<bool> bDirectLOS;
+    TArray<FBandEnergy> DirectTransmissionEnergy;
     TArray<float> AirAbsorptionCutoffHz;
     float BatchMaxDistance = 0.f;
+	
+    FCollisionQueryParams DirectTraceParams;
+    DirectTraceParams.bReturnPhysicalMaterial = true;
 
     for (uint32 SourceId : SourceIds)
     {
@@ -184,7 +190,32 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
         }
 
         FHitResult DirectHit;
-        const bool bBlocked = World->LineTraceSingleByChannel(DirectHit, ListenerPos, EmitterPosition, ECC_Visibility);
+        const bool bBlocked = World->LineTraceSingleByChannel(DirectHit, ListenerPos, EmitterPosition, ECC_Visibility, DirectTraceParams);
+
+        FBandEnergy DirectEnergy; // defaults to {1,1,1} fully audible, unblocked case
+
+        if (bBlocked)
+        {
+            if (const UAcousticPhysicalMaterial* AcousticPhysMat = Cast<UAcousticPhysicalMaterial>(DirectHit.PhysMaterial.Get()))
+            {
+                if (const UAcousticMaterialAsset* Mat = AcousticPhysMat->AcousticMaterial.Get())
+                {
+                    TArrayView<const float> Transmission = Mat->GetTransmission();
+                    for (int32 Band = 0; Band < 3; ++Band)
+                    {
+                        DirectEnergy.Bands[Band] = Transmission[Band];
+                    }
+                }
+                else
+                {
+                    DirectEnergy = FBandEnergy{ {0.f, 0.f, 0.f} }; // tagged but no asset assigned: treat as fully opaque
+                }
+            }
+            else
+            {
+                DirectEnergy = FBandEnergy{ {0.f, 0.f, 0.f} }; // untagged geometry: assume fully blocking
+            }
+        }
 
         const float Distance = FVector::Dist(ListenerPos, EmitterPosition);
 
@@ -201,6 +232,7 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
         ValidSourceIds.Add(SourceId);
         EmitterPositions.Add(EmitterPosition);
         bDirectLOS.Add(!bBlocked);
+        DirectTransmissionEnergy.Add(DirectEnergy);
         AirAbsorptionCutoffHz.Add(CutoffHz);
         BatchMaxDistance = FMath::Max(BatchMaxDistance, Distance);
     }
@@ -210,12 +242,9 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
 
     const float DynamicMaxRayLength = FMath::Max(MaxRayLength, BatchMaxDistance * 5.5f);
 
-    // Small wrapper struct instead of a raw float[3], since a plain C array
-    // can't be used as a TArray element type directly.
-    struct FBandEnergy { float Bands[3] = { 0.f, 0.f, 0.f }; };
-
-    TArray<FBandEnergy> TotalLoss;
-    TotalLoss.Init(FBandEnergy(), NumSources);
+    struct FLossAccumulator { float Bands[3] = { 0.f, 0.f, 0.f }; };
+    TArray<FLossAccumulator> TotalLoss;
+    TotalLoss.Init(FLossAccumulator(), NumSources);
 
     FCollisionQueryParams CollisionQueryParams;
     CollisionQueryParams.bReturnPhysicalMaterial = true;
@@ -224,10 +253,10 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
     {
         TArray<bool> bConnected = bDirectLOS;
 
-        FVector SegmentStart = ListenerPos; // start of the current ray segment
+        FVector SegmentStart = ListenerPos;
+        FVector PreviousSegmentStart = ListenerPos;
         FVector LastHitNormal = FVector::ZeroVector;
-    	FVector PreviousSegmentStart = ListenerPos; 
-    	float LastHitScattering = 0.5f;
+        float LastHitScattering = 0.5f;
         bool bHasHitSurface = false;
 
         float RayEnergy[3] = { 1.f, 1.f, 1.f };
@@ -237,12 +266,16 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
             FVector RandomDir;
 
             if (!bHasHitSurface)
-            	RandomDir = FMath::VRand();
+            {
+                RandomDir = FMath::VRand();
+            }
             else
             {
                 const float ScatterRoll = FMath::FRand();
                 if (ScatterRoll < LastHitScattering)
-                	RandomDir = RandomCosineWeightedHemisphere(LastHitNormal);
+                {
+                    RandomDir = RandomCosineWeightedHemisphere(LastHitNormal);
+                }
                 else
                 {
                     const FVector IncomingDir = (SegmentStart - PreviousSegmentStart).GetSafeNormal();
@@ -257,7 +290,7 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
             if (!HitResult.IsValidBlockingHit())
                 break;
 
-            float HitScattering = 0.5f; // default if no acoustic material found
+            float HitScattering = 0.5f;
 
             if (const UAcousticPhysicalMaterial* AcousticPhysMat = Cast<UAcousticPhysicalMaterial>(HitResult.PhysMaterial.Get()))
             {
@@ -283,7 +316,6 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
             LastHitScattering = HitScattering;
             bHasHitSurface = true;
 
-            // Next Event Estimation
             for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
             {
                 if (bConnected[SrcIdx])
@@ -324,7 +356,13 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
         FWriteScopeLock Lock(RayData->Lock);
         for (int32 Band = 0; Band < 3; ++Band)
         {
-            const float NewEstimate = TotalLoss[SrcIdx].Bands[Band] / float(OcclusionRayCount);
+            const float IndirectLoss = TotalLoss[SrcIdx].Bands[Band] / float(OcclusionRayCount);
+            const float IndirectEnergy = 1.f - IndirectLoss;
+            const float DirectEnergy = DirectTransmissionEnergy[SrcIdx].Bands[Band];
+        	
+            const float FinalEnergy = DirectEnergy + (1.f - DirectEnergy) * IndirectEnergy;
+            const float NewEstimate = 1.f - FinalEnergy;
+
             if (!RayData->bHasValidEstimate)
             {
                 RayData->DirectTransmissionLoss[Band] = NewEstimate;
