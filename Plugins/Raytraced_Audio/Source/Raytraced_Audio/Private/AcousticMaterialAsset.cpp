@@ -10,6 +10,8 @@ void UAcousticMaterialAsset::BakeData()
 {
 	BakeTransmissionData();
 	BakeAbsorptionData();
+    ValidateEnergyBudget();
+    BakedScattering = Scattering;
 }
 
 void UAcousticMaterialAsset::PreSave(FObjectPreSaveContext SaveContext)
@@ -136,6 +138,28 @@ void UAcousticMaterialAsset::BakeAbsorptionData()
     for (int32 i = 0; i < FrequencyBands.Num(); ++i)
     {
         Absorption[i] = InterpolateLogFrequency((float)FrequencyBands[i], PublishedFrequencies, PublishedValues, 6);
+    }
+}
+
+void UAcousticMaterialAsset::ValidateEnergyBudget()
+{
+    for (int32 Band = 0; Band < 3; ++Band)
+    {
+        const float Sum = Absorption[Band] + Transmission[Band];
+
+        if (Sum > 1.f)
+        {
+            const float ScaleFactor = 1.f / Sum;
+            const float OldAbsorption = Absorption[Band];
+            const float OldTransmission = Transmission[Band];
+
+            Absorption[Band] *= ScaleFactor;
+            Transmission[Band] *= ScaleFactor;
+
+            UE_LOG(LogTemp, Warning,
+                TEXT("RTA: %s band %d: Absorption(%.3f) + Transmission(%.3f) = %.3f exceeds 1.0. Rescaled to Absorption=%.3f, Transmission=%.3f."),
+                *GetName(), Band, OldAbsorption, OldTransmission, Sum, Absorption[Band], Transmission[Band]);
+        }
     }
 }
 

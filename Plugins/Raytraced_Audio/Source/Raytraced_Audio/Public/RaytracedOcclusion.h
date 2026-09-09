@@ -4,6 +4,8 @@
 
 struct FOcclusionFilterState
 {
+	float PrevLow = 0.f;
+	float PrevMidLP = 0.f;
 	float PrevOutput = 0.f;
 };
 

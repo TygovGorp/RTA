@@ -164,7 +164,7 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
         FReadScopeLock Lock(ListenerData->Lock);
         ListenerPos = ListenerData->ListenerPosition;
     }
-	
+
     TArray<TSharedPtr<FSourceRayData>> ValidSourceData;
     TArray<uint32> ValidSourceIds;
     TArray<FVector> EmitterPositions;
@@ -188,7 +188,6 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
 
         const float Distance = FVector::Dist(ListenerPos, EmitterPosition);
 
-        // Air absorption
         float CutoffHz;
         {
             FReadScopeLock Lock(RayData->Lock);
@@ -210,41 +209,78 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
     if (NumSources == 0) return;
 
     const float DynamicMaxRayLength = FMath::Max(MaxRayLength, BatchMaxDistance * 5.5f);
-	
-    TArray<float> TotalLoss;
-    TotalLoss.Init(0.f, NumSources);
-	
-	FCollisionQueryParams CollisionQueryParams;
-	CollisionQueryParams.bReturnPhysicalMaterial = true;
+
+    // Small wrapper struct instead of a raw float[3], since a plain C array
+    // can't be used as a TArray element type directly.
+    struct FBandEnergy { float Bands[3] = { 0.f, 0.f, 0.f }; };
+
+    TArray<FBandEnergy> TotalLoss;
+    TotalLoss.Init(FBandEnergy(), NumSources);
+
+    FCollisionQueryParams CollisionQueryParams;
+    CollisionQueryParams.bReturnPhysicalMaterial = true;
 
     for (int32 RayNum = 0; RayNum < OcclusionRayCount; ++RayNum)
     {
-        TArray<bool> bConnected = bDirectLOS; // direct-LOS sources start "connected", skip them below
+        TArray<bool> bConnected = bDirectLOS;
 
-        FVector CurrentPos = ListenerPos;
+        FVector SegmentStart = ListenerPos; // start of the current ray segment
         FVector LastHitNormal = FVector::ZeroVector;
+    	FVector PreviousSegmentStart = ListenerPos; 
+    	float LastHitScattering = 0.5f;
         bool bHasHitSurface = false;
+
+        float RayEnergy[3] = { 1.f, 1.f, 1.f };
 
         for (int32 Depth = 0; Depth < OcclusionMaxDepth; ++Depth)
         {
-            const FVector RandomDir = bHasHitSurface
-                ? RandomCosineWeightedHemisphere(LastHitNormal)
-                : FMath::VRand();
-            const FVector TraceEnd = CurrentPos + RandomDir * DynamicMaxRayLength;
+            FVector RandomDir;
+
+            if (!bHasHitSurface)
+            	RandomDir = FMath::VRand();
+            else
+            {
+                const float ScatterRoll = FMath::FRand();
+                if (ScatterRoll < LastHitScattering)
+                	RandomDir = RandomCosineWeightedHemisphere(LastHitNormal);
+                else
+                {
+                    const FVector IncomingDir = (SegmentStart - PreviousSegmentStart).GetSafeNormal();
+                    RandomDir = FMath::GetReflectionVector(IncomingDir, LastHitNormal);
+                }
+            }
+
+            const FVector TraceEnd = SegmentStart + RandomDir * DynamicMaxRayLength;
 
             FHitResult HitResult;
-            World->LineTraceSingleByChannel(HitResult, CurrentPos, TraceEnd, ECC_Visibility, CollisionQueryParams);
+            World->LineTraceSingleByChannel(HitResult, SegmentStart, TraceEnd, ECC_Visibility, CollisionQueryParams);
             if (!HitResult.IsValidBlockingHit())
                 break;
-        	
-        	if (const UAcousticPhysicalMaterial* AcousticPhysMat = Cast<UAcousticPhysicalMaterial>(HitResult.PhysMaterial.Get()))
-        	{
-        		//AcousticPhysMat->AcousticMaterial.Get();
-        	}
+
+            float HitScattering = 0.5f; // default if no acoustic material found
+
+            if (const UAcousticPhysicalMaterial* AcousticPhysMat = Cast<UAcousticPhysicalMaterial>(HitResult.PhysMaterial.Get()))
+            {
+                if (const UAcousticMaterialAsset* Mat = AcousticPhysMat->AcousticMaterial.Get())
+                {
+                    TArrayView<const float> Absorption = Mat->GetAbsorption();
+                    TArrayView<const float> Transmission = Mat->GetTransmission();
+
+                    for (int32 Band = 0; Band < 3; ++Band)
+                    {
+                        const float Reflected = 1.f - Absorption[Band] - Transmission[Band];
+                        RayEnergy[Band] *= FMath::Clamp(Reflected, 0.f, 1.f);
+                    }
+
+                    HitScattering = Mat->GetBakedScattering();
+                }
+            }
 
             constexpr float SurfaceBias = 1.f;
-            CurrentPos = HitResult.Location + HitResult.Normal * SurfaceBias;
+            PreviousSegmentStart = SegmentStart;
+            SegmentStart = HitResult.Location + HitResult.Normal * SurfaceBias;
             LastHitNormal = HitResult.Normal;
+            LastHitScattering = HitScattering;
             bHasHitSurface = true;
 
             // Next Event Estimation
@@ -255,11 +291,14 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
 
                 FHitResult NEEHitResult;
                 const bool bNEEHit = World->LineTraceSingleByChannel(
-                    NEEHitResult, CurrentPos, EmitterPositions[SrcIdx], ECC_Visibility);
+                    NEEHitResult, SegmentStart, EmitterPositions[SrcIdx], ECC_Visibility);
 
                 if (!bNEEHit)
                 {
-                    TotalLoss[SrcIdx] += 1.f - (1.f / float(Depth + 1));
+                    for (int32 Band = 0; Band < 3; ++Band)
+                    {
+                        TotalLoss[SrcIdx].Bands[Band] += (1.f - RayEnergy[Band]);
+                    }
                     bConnected[SrcIdx] = true;
                 }
             }
@@ -269,31 +308,47 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
         {
             if (!bConnected[SrcIdx])
             {
-                TotalLoss[SrcIdx] += 1.f; // never reached this source on this ray: full loss
+                for (int32 Band = 0; Band < 3; ++Band)
+                {
+                    TotalLoss[SrcIdx].Bands[Band] += 1.f;
+                }
             }
         }
     }
 
-    constexpr float SmoothingAlpha = 0.15f; // tune: lower = smoother/slower, higher = snappier/more jitter
+    constexpr float SmoothingAlpha = 0.15f;
     for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
     {
-        const float NewEstimate = TotalLoss[SrcIdx] / float(OcclusionRayCount);
         TSharedPtr<FSourceRayData>& RayData = ValidSourceData[SrcIdx];
 
         FWriteScopeLock Lock(RayData->Lock);
+        for (int32 Band = 0; Band < 3; ++Band)
+        {
+            const float NewEstimate = TotalLoss[SrcIdx].Bands[Band] / float(OcclusionRayCount);
+            if (!RayData->bHasValidEstimate)
+            {
+                RayData->DirectTransmissionLoss[Band] = NewEstimate;
+            }
+            else
+            {
+                RayData->DirectTransmissionLoss[Band] = FMath::Lerp(RayData->DirectTransmissionLoss[Band], NewEstimate, SmoothingAlpha);
+            }
+        }
+
         if (!RayData->bHasValidEstimate)
         {
-            RayData->DirectTransmissionLoss = NewEstimate;
             RayData->DirectLowpassCutoffHz = AirAbsorptionCutoffHz[SrcIdx];
             RayData->bHasValidEstimate = true;
         }
         else
         {
-            RayData->DirectTransmissionLoss = FMath::Lerp(RayData->DirectTransmissionLoss, NewEstimate, SmoothingAlpha);
             RayData->DirectLowpassCutoffHz = FMath::Lerp(RayData->DirectLowpassCutoffHz, AirAbsorptionCutoffHz[SrcIdx], SmoothingAlpha);
         }
 
-        UE_LOG(LogTemp, Log, TEXT("RTA: SourceId=%u Loss=%.2f CutoffHz=%.0f"), ValidSourceIds[SrcIdx], RayData->DirectTransmissionLoss, RayData->DirectLowpassCutoffHz);
+        UE_LOG(LogTemp, Log, TEXT("RTA: SourceId=%u Loss=[%.2f,%.2f,%.2f] CutoffHz=%.0f"),
+            ValidSourceIds[SrcIdx],
+            RayData->DirectTransmissionLoss[0], RayData->DirectTransmissionLoss[1], RayData->DirectTransmissionLoss[2],
+            RayData->DirectLowpassCutoffHz);
     }
 }
 

@@ -9,7 +9,7 @@ public:
 	{
 		FSourceRayData()
 		{
-			DirectTransmissionLoss	= 1.f;
+			DirectTransmissionLoss	= {1.f};
 			DirectLowpassCutoffHz	= 20000.f;
 			AccumulatedLoss = 0.f;
 			SuccessfulRayCount = 0; 
@@ -39,7 +39,7 @@ public:
 		}
 		
 		FRWLock Lock;
-		float DirectTransmissionLoss = 1.f;   // 0 = fully audible, 1 = fully blocked
+		TStaticArray<float, 3> DirectTransmissionLoss = {1.f};   // 0 = fully audible, 1 = fully blocked
 		float AccumulatedLoss = 0.f;
 		int32 SuccessfulRayCount = 0; 
 		bool bHasValidEstimate     = false;

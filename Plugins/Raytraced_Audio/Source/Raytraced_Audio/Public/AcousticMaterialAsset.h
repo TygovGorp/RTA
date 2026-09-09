@@ -50,6 +50,7 @@ class RAYTRACED_AUDIO_API UAcousticMaterialAsset : public UDataAsset
 {
 	GENERATED_BODY()
 public:
+	
 	UFUNCTION(CallInEditor, Category = "General")
 	void BakeData();
 	
@@ -71,6 +72,8 @@ public:
 	EMountingCondition MountingCondition;
 	UPROPERTY(EditAnywhere, Category = "Transmission")
 	float PanelArea; //m^2
+	UPROPERTY(EditAnywhere, Category = "Data", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float Scattering = 0.5f;
 	
 	//Double Leaf Inputs fields
 	UPROPERTY(EditAnywhere, Category = "Transmission",
@@ -108,14 +111,18 @@ public:
 	float OverrideAbsorption[3] = { 0.f, 0.f, 0.f };
 #endif
 	
-	const float* GetTransmission() const {return Transmission;}
-	const float* GetAbsorption() const {return Absorption;}
+	TArrayView<const float> GetTransmission() const { return TArrayView(Transmission, 3); }
+	TArrayView<const float> GetAbsorption()  const { return TArrayView(Absorption, 3); }
+	float GetBakedScattering()  const { return BakedScattering; }
 
 private:
 #if WITH_EDITOR
 	
 	void BakeTransmissionData();
 	void BakeAbsorptionData();
+#if WITH_EDITOR
+	void ValidateEnergyBudget();
+#endif
 	
 	float GetMassAirMassPenalty() const;
 #endif
@@ -129,9 +136,10 @@ private:
 	//Baked Output
 	UPROPERTY(VisibleAnywhere, Category = "Baked")
 	float Transmission[3];
-
 	UPROPERTY(VisibleAnywhere, Category = "Baked")
 	float Absorption[3];
+	UPROPERTY(VisibleAnywhere, Category = "Baked")
+	float BakedScattering = 0.5f;
 };
 
 UCLASS()
