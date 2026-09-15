@@ -1,6 +1,7 @@
 ﻿#include "RaytraceManager.h"
 
 #include "AcousticMaterialAsset.h"
+#include "Physics/Experimental/PhysScene_Chaos.h"
 
 FRaytraceManager::FRaytraceManager() : World(nullptr)
 {
@@ -190,6 +191,8 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
         }
 
         FHitResult DirectHit;
+    	if (!World.IsValid()) return;
+    	if (!World->GetPhysicsScene() || World->GetPhysicsScene()->GetSolver() == nullptr) return;
         const bool bBlocked = World->LineTraceSingleByChannel(DirectHit, ListenerPos, EmitterPosition, ECC_Visibility, DirectTraceParams);
 
         FBandEnergy DirectEnergy; // defaults to {1,1,1} fully audible, unblocked case

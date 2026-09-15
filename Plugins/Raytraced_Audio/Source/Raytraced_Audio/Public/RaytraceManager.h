@@ -90,7 +90,7 @@ private:
 	int OcclusionMaxDepth = 8;
 	float MaxRayLength = 1000;
 	
-	UWorld* World; 
+	TWeakObjectPtr<UWorld> World; 
 	TMap<uint32, TSharedPtr<FSourceRayData>> Results; 
 	FRWLock ResultsLock;
 };
