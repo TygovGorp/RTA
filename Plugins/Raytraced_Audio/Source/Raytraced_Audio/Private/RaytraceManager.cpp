@@ -178,6 +178,7 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
 	
     FCollisionQueryParams DirectTraceParams;
     DirectTraceParams.bReturnPhysicalMaterial = true;
+	DirectTraceParams.bTraceComplex = true; 
 
     for (uint32 SourceId : SourceIds)
     {
