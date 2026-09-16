@@ -7,18 +7,13 @@ FRaytraceManager::FRaytraceManager() : World(nullptr)
 {
 	UE_LOG(LogTemp, Log, TEXT("RTA: Create New Manager"))
 	
-	OcclusionDelegateHandle = FTSTicker::GetCoreTicker().AddTicker(
-		FTickerDelegate::CreateRaw(this, &FRaytraceManager::TickOcclusion), 
-		OcclusionTickInterval);
-	
-	ReverbDelegateHandle = FTSTicker::GetCoreTicker().AddTicker(
-		FTickerDelegate::CreateRaw(this, &FRaytraceManager::TickReverb), 
-		ReverbTickInterval);
+	AudioTraceDelegateHandle = FTSTicker::GetCoreTicker().AddTicker(
+		FTickerDelegate::CreateRaw(this, &FRaytraceManager::TickAudioTrace), 
+		AudioTraceTickInterval);
 }
 FRaytraceManager::~FRaytraceManager()
 {
-	FTSTicker::GetCoreTicker().RemoveTicker(OcclusionDelegateHandle);
-	FTSTicker::GetCoreTicker().RemoveTicker(ReverbDelegateHandle);
+	FTSTicker::GetCoreTicker().RemoveTicker(AudioTraceDelegateHandle);
 }
 
 void FRaytraceManager::RegisterSource(uint32 SourceId,
@@ -106,7 +101,7 @@ FRaytraceManager::FSourceRayData FRaytraceManager::GetLatestResults(uint32 Sourc
 	return LatestResult;
 }
 
-bool FRaytraceManager::TickOcclusion(float DeltaTime)
+bool FRaytraceManager::TickAudioTrace(float /*DeltaTime*/)
 {
 	TArray<uint32> SourceIdsToTrace;
 
@@ -125,26 +120,10 @@ bool FRaytraceManager::TickOcclusion(float DeltaTime)
 	}
 	ResultsLock.ReadUnlock();
 
-	RunOcclusionTrace(SourceIdsToTrace);
+	RunAudioTrace(SourceIdsToTrace);
 	return true;
 }
 
-bool FRaytraceManager::TickReverb(float DeltaTime)
-{
-	ResultsLock.ReadLock();
-	for (TTuple<uint32, TSharedPtr<FSourceRayData>> Result : Results)
-	{
-		if (Result.Value.Get()->DirtyReverb)
-		{
-			Result.Value.Get()->Lock.WriteLock();
-			Result.Value.Get()->DirtyReverb = false;
-			Result.Value.Get()->Lock.WriteUnlock();
-			RunReverbTraces(Result.Key);
-		}
-	}
-	ResultsLock.ReadUnlock();
-	return true;
-}
 
 TSharedPtr<FRaytraceManager::FSourceRayData> FRaytraceManager::FindSourceRayData(uint32 SourceId)
 {
@@ -153,7 +132,7 @@ TSharedPtr<FRaytraceManager::FSourceRayData> FRaytraceManager::FindSourceRayData
     return Entry ? *Entry : nullptr;
 }
 
-void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
+void FRaytraceManager::RunAudioTrace(const TArray<uint32>& SourceIds)
 {
     if (SourceIds.Num() == 0) return;
 
@@ -253,7 +232,7 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
     FCollisionQueryParams CollisionQueryParams;
     CollisionQueryParams.bReturnPhysicalMaterial = true;
 
-    for (int32 RayNum = 0; RayNum < OcclusionRayCount; ++RayNum)
+    for (int32 RayNum = 0; RayNum < RayCount; ++RayNum)
     {
         TArray<bool> bConnected = bDirectLOS;
 
@@ -265,7 +244,7 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
 
         float RayEnergy[3] = { 1.f, 1.f, 1.f };
 
-        for (int32 Depth = 0; Depth < OcclusionMaxDepth; ++Depth)
+        for (int32 Depth = 0; Depth < MaxDepth; ++Depth)
         {
             FVector RandomDir;
 
@@ -360,7 +339,7 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
         FWriteScopeLock Lock(RayData->Lock);
         for (int32 Band = 0; Band < 3; ++Band)
         {
-            const float IndirectLoss = TotalLoss[SrcIdx].Bands[Band] / float(OcclusionRayCount);
+            const float IndirectLoss = TotalLoss[SrcIdx].Bands[Band] / float(RayCount);
             const float IndirectEnergy = 1.f - IndirectLoss;
             const float DirectEnergy = DirectTransmissionEnergy[SrcIdx].Bands[Band];
         	
@@ -392,11 +371,6 @@ void FRaytraceManager::RunOcclusionTrace(const TArray<uint32>& SourceIds)
             RayData->DirectTransmissionLoss[0], RayData->DirectTransmissionLoss[1], RayData->DirectTransmissionLoss[2],
             RayData->DirectLowpassCutoffHz);
     }
-}
-
-void FRaytraceManager::RunReverbTraces(uint32 SourceId)
-{
-	
 }
 
 FVector FRaytraceManager::RandomCosineWeightedHemisphere(const FVector& Normal)

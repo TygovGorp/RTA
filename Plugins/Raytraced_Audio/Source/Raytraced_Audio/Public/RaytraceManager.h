@@ -73,21 +73,17 @@ public:
 	
 	void SetWorld(UWorld* WorldIn) { this->World = WorldIn; }
 private:
-	bool TickOcclusion(float DeltaTime);
-	bool TickReverb(float DeltaTime);
+	bool TickAudioTrace(float DeltaTime);
 	TSharedPtr<FSourceRayData> FindSourceRayData(uint32 SourceId);
 
-	void RunOcclusionTrace(const TArray<uint32>& SourceIds);   // scheduled frequently
-	void RunReverbTraces(uint32 SourceId);     // scheduled less frequently
+	void RunAudioTrace(const TArray<uint32>& SourceIds);  
 	
 	static FVector RandomCosineWeightedHemisphere(const FVector& Normal);
 	
-	FTSTicker::FDelegateHandle OcclusionDelegateHandle;
-	FTSTicker::FDelegateHandle ReverbDelegateHandle;
-	float OcclusionTickInterval = 0.033f;
-	float ReverbTickInterval = 0.25f;
-	int OcclusionRayCount = 1028;
-	int OcclusionMaxDepth = 8;
+	FTSTicker::FDelegateHandle AudioTraceDelegateHandle;
+	float AudioTraceTickInterval = 0.033f;
+	int RayCount = 1028;
+	int MaxDepth = 8;
 	float MaxRayLength = 1000;
 	
 	TWeakObjectPtr<UWorld> World; 
