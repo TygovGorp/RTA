@@ -108,7 +108,8 @@ bool FRaytraceManager::TickAudioTrace(float /*DeltaTime*/)
 	{
 		if (Result.Value->bDirty 
 			&& Result.Value->bListenerPositionSet 
-			&& Result.Value->bEmitterPositionSet)
+			&& Result.Value->bEmitterPositionSet
+			&& !Result.Value->bTraceInFlight)
 		{
 			Result.Value->Lock.WriteLock();
 			Result.Value->bDirty = false;
