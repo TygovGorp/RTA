@@ -1,5 +1,6 @@
 ﻿#include "AcousticMaterialAsset.h"
 
+#include "Log.h"
 #include "UObject/ObjectSaveContext.h"
 
 constexpr float SpeedOfSoundAir = 343.0f;
@@ -26,7 +27,7 @@ void UAcousticMaterialAsset::BakeTransmissionData()
     float FlexuralRigidity = (YoungsModulus * (Thickness * Thickness * Thickness)) / (12 * (1 - (PoissonsRatio * PoissonsRatio)));
     float CoincidenceFrequency = (SpeedOfSoundAir * SpeedOfSoundAir / UE_TWO_PI) * FMath::Sqrt(Mass / FlexuralRigidity);
     
-    UE_LOG(LogTemp, Log, TEXT("RTA: CoincidenceFrequency: %.2f"), CoincidenceFrequency);
+    UE_LOG(LogRTA, Log, TEXT("CoincidenceFrequency: %.2f"), CoincidenceFrequency);
 
     float LossFactor = 0.f;
     switch (MountingCondition)
@@ -124,7 +125,7 @@ void UAcousticMaterialAsset::BakeAbsorptionData()
     FAcousticAbsorptionRow* Row = AbsorptionRow.GetRow<FAcousticAbsorptionRow>(TEXT("BakeAbsorptionData"));
     if (!Row)
     {
-        UE_LOG(LogTemp, Warning, TEXT("RTA: AbsorptionRow not set or invalid on %s"), *GetName());
+        UE_LOG(LogRTA, Warning, TEXT("AbsorptionRow not set or invalid on %s"), *GetName());
         return;
     }
 
@@ -156,8 +157,8 @@ void UAcousticMaterialAsset::ValidateEnergyBudget()
             Absorption[Band] *= ScaleFactor;
             Transmission[Band] *= ScaleFactor;
 
-            UE_LOG(LogTemp, Warning,
-                TEXT("RTA: %s band %d: Absorption(%.3f) + Transmission(%.3f) = %.3f exceeds 1.0. Rescaled to Absorption=%.3f, Transmission=%.3f."),
+            UE_LOG(LogRTA, Warning,
+                TEXT("%s band %d: Absorption(%.3f) + Transmission(%.3f) = %.3f exceeds 1.0. Rescaled to Absorption=%.3f, Transmission=%.3f."),
                 *GetName(), Band, OldAbsorption, OldTransmission, Sum, Absorption[Band], Transmission[Band]);
         }
     }

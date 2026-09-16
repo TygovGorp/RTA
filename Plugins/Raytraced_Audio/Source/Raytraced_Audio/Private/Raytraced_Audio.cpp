@@ -1,11 +1,14 @@
 #include "Raytraced_Audio.h"
+#include "Log.h"
+
+DEFINE_LOG_CATEGORY(LogRTA);
 
 #define LOCTEXT_NAMESPACE "FRaytraced_AudioModule"
 
 void FRaytracedAudioModule::StartupModule()
 {
 	// This code will execute after your module is loaded into memory; the exact timing is specified in the .uplugin file per-module
-	UE_LOG(LogTemp, Log, TEXT("RTA: Started"));
+	UE_LOG(LogRTA, Log, TEXT("Started"));
 	
 	
 	AudioPluginListener = MakeShared<FAudioPluginListener>();

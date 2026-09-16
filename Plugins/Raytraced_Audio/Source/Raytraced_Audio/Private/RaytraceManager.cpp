@@ -2,10 +2,11 @@
 
 #include "AcousticMaterialAsset.h"
 #include "Physics/Experimental/PhysScene_Chaos.h"
+#include "Log.h"
 
 FRaytraceManager::FRaytraceManager() : World(nullptr)
 {
-	UE_LOG(LogTemp, Log, TEXT("RTA: Create New Manager"))
+	UE_LOG(LogRTA, Log, TEXT("Create New Manager"))
 	
 	AudioTraceDelegateHandle = FTSTicker::GetCoreTicker().AddTicker(
 		FTickerDelegate::CreateRaw(this, &FRaytraceManager::TickAudioTrace), 
@@ -29,7 +30,7 @@ void FRaytraceManager::RegisterSource(uint32 SourceId,
 	NewData->AirAbsorptionCutoffAtMaxDistance = AirAbsorptionCutoffAtMaxDistance;
 
 	this->ResultsLock.WriteLock();
-	if (Results.Find(SourceId) != nullptr) UE_LOG(LogTemp, Warning, TEXT("RTA: SourceId already present in Results Map"));
+	if (Results.Find(SourceId) != nullptr) UE_LOG(LogRTA, Warning, TEXT("SourceId already present in Results Map"));
 	this->Results.Add(SourceId, NewData);
 	this->ResultsLock.WriteUnlock();
 }
@@ -315,22 +316,25 @@ void FRaytraceManager::RunAudioTrace(const TArray<uint32>& SourceIds)
 				LastHitScattering = HitScattering;
 				bHasHitSurface = true;
 
-				for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
 				{
-					if (bConnected[SrcIdx])
-						continue;
-
-					FHitResult NEEHitResult;
-					const bool bNEEHit = World->LineTraceSingleByChannel(
-						NEEHitResult, SegmentStart, EmitterPositions[SrcIdx], ECC_Visibility);
-
-					if (!bNEEHit)
+					TRACE_CPUPROFILER_EVENT_SCOPE(RTA_BounceNeeRays);
+					for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
 					{
-						for (int32 Band = 0; Band < 3; ++Band)
+						if (bConnected[SrcIdx])
+							continue;
+
+						FHitResult NEEHitResult;
+						const bool bNEEHit = World->LineTraceSingleByChannel(
+							NEEHitResult, SegmentStart, EmitterPositions[SrcIdx], ECC_Visibility);
+
+						if (!bNEEHit)
 						{
-							TotalLoss[SrcIdx].Bands[Band] += (1.f - RayEnergy[Band]);
+							for (int32 Band = 0; Band < 3; ++Band)
+							{
+								TotalLoss[SrcIdx].Bands[Band] += (1.f - RayEnergy[Band]);
+							}
+							bConnected[SrcIdx] = true;
 						}
-						bConnected[SrcIdx] = true;
 					}
 				}
 			}
@@ -383,7 +387,7 @@ void FRaytraceManager::RunAudioTrace(const TArray<uint32>& SourceIds)
             RayData->DirectLowpassCutoffHz = FMath::Lerp(RayData->DirectLowpassCutoffHz, AirAbsorptionCutoffHz[SrcIdx], SmoothingAlpha);
         }
 
-        UE_LOG(LogTemp, Log, TEXT("RTA: SourceId=%u Loss=[%.2f,%.2f,%.2f] CutoffHz=%.0f"),
+        UE_LOG(LogRTA, Log, TEXT("SourceId=%u Loss=[%.2f,%.2f,%.2f] CutoffHz=%.0f"),
             ValidSourceIds[SrcIdx],
             RayData->DirectTransmissionLoss[0], RayData->DirectTransmissionLoss[1], RayData->DirectTransmissionLoss[2],
             RayData->DirectLowpassCutoffHz);

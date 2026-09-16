@@ -1,10 +1,11 @@
 ﻿#include "RaytracedOcclusion.h"
 #include "RTAOcclusionSourceSettings.h"
+#include "log.h"
 
 void FRaytracedOcclusion::Initialize(const FAudioPluginInitializationParams InitializationParams)
 {
 	SampleRate = InitializationParams.SampleRate;
-	UE_LOG(LogTemp, Warning, TEXT("RTA: SampleRate=%f"), SampleRate);
+	UE_LOG(LogRTA, Warning, TEXT("SampleRate=%f"), SampleRate);
 }
 
 void FRaytracedOcclusion::Shutdown()
@@ -14,7 +15,7 @@ void FRaytracedOcclusion::Shutdown()
 void FRaytracedOcclusion::OnInitSource(const uint32 SourceId, const FName& /*AudioComponentUserId*/,
 	const uint32 /*NumChannels*/, UOcclusionPluginSourceSettingsBase* InSettings)
 {
-	UE_LOG(LogTemp, Log, TEXT("RTA: Init Source"));
+	UE_LOG(LogRTA, Log, TEXT("Init Source"));
 	
 	if (const URTAOcclusionSourceSettings* RTASettings = Cast<URTAOcclusionSourceSettings>(InSettings))
 	{
@@ -68,7 +69,7 @@ void FRaytracedOcclusion::ProcessAudio(const FAudioPluginSourceInputData& InputD
 
     if (!FilterState)
     {
-        UE_LOG(LogTemp, Warning, TEXT("RTA: No filter state for SourceId=%u, applying gain only"), InputData.SourceId);
+        UE_LOG(LogRTA, Warning, TEXT("No filter state for SourceId=%u, applying gain only"), InputData.SourceId);
         for (int32 i = 0; i < NumSamples; ++i)
         {
             OutputData.AudioBuffer[i] = (*InputData.AudioBuffer)[i] * GainBands[1];
