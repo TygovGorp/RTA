@@ -51,13 +51,12 @@ void FRaytraceManager::UpdateEmitterPosition(uint32 SourceId, const FVector& Pos
 
 	RayData->Lock.WriteLock();
 	bool bIsFirstSet = !RayData->bEmitterPositionSet;
-	bool bChanged = bIsFirstSet || RayData->EmitterPosition != Position;
+	bool bChanged = bIsFirstSet || FVector::DistSquared(RayData->EmitterPosition, Position) > FMath::Square(MinPositionDeltaForDirty);
 	if (bChanged)
 	{
 		RayData->EmitterPosition = Position;
 		RayData->bEmitterPositionSet = true;
-		RayData->DirtyOcclusion = true;
-		RayData->DirtyReverb = true;
+		RayData->bDirty = true;
 	}
 	RayData->Lock.WriteUnlock();
 }
@@ -72,13 +71,12 @@ void FRaytraceManager::UpdateListenerPosition(uint32 SourceId, const FVector& Po
 
 	RayData->Lock.WriteLock();
 	bool bIsFirstSet = !RayData->bListenerPositionSet;
-	bool bChanged = bIsFirstSet || RayData->ListenerPosition != Position;
+	bool bChanged = bIsFirstSet || FVector::DistSquared(RayData->ListenerPosition, Position) > FMath::Square(MinPositionDeltaForDirty);
 	if (bChanged)
 	{
 		RayData->ListenerPosition = Position;
 		RayData->bListenerPositionSet = true;
-		RayData->DirtyOcclusion = true;
-		RayData->DirtyReverb = true;
+		RayData->bDirty = true;
 	}
 	RayData->Lock.WriteUnlock();
 }
@@ -108,19 +106,28 @@ bool FRaytraceManager::TickAudioTrace(float /*DeltaTime*/)
 	ResultsLock.ReadLock();
 	for (const TTuple<uint32, TSharedPtr<FSourceRayData>>& Result : Results)
 	{
-		if (Result.Value->DirtyOcclusion 
+		if (Result.Value->bDirty 
 			&& Result.Value->bListenerPositionSet 
 			&& Result.Value->bEmitterPositionSet)
 		{
 			Result.Value->Lock.WriteLock();
-			Result.Value->DirtyOcclusion = false;
+			Result.Value->bDirty = false;
+			Result.Value->bTraceInFlight = true;
 			Result.Value->Lock.WriteUnlock();
 			SourceIdsToTrace.Add(Result.Key);
 		}
 	}
 	ResultsLock.ReadUnlock();
 
-	RunAudioTrace(SourceIdsToTrace);
+	TWeakPtr<FRaytraceManager, ESPMode::ThreadSafe> WeakSelf = AsWeak();
+	UE::Tasks::Launch(TEXT("RTA_AudioTrace"), [WeakSelf, SourceIdsToTrace]()
+	{
+		if (TSharedPtr<FRaytraceManager, ESPMode::ThreadSafe> Self = WeakSelf.Pin())
+		{
+			Self->RunAudioTrace(SourceIdsToTrace);
+		}
+	}, LowLevelTasks::ETaskPriority::BackgroundLow);
+	
 	return true;
 }
 
@@ -134,6 +141,7 @@ TSharedPtr<FRaytraceManager::FSourceRayData> FRaytraceManager::FindSourceRayData
 
 void FRaytraceManager::RunAudioTrace(const TArray<uint32>& SourceIds)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(RTA_RunAudioTrace);
     if (SourceIds.Num() == 0) return;
 
     TSharedPtr<FSourceRayData> ListenerData = FindSourceRayData(SourceIds[0]);
@@ -159,66 +167,69 @@ void FRaytraceManager::RunAudioTrace(const TArray<uint32>& SourceIds)
     DirectTraceParams.bReturnPhysicalMaterial = true;
 	DirectTraceParams.bTraceComplex = true; 
 
-    for (uint32 SourceId : SourceIds)
-    {
-        TSharedPtr<FSourceRayData> RayData = FindSourceRayData(SourceId);
-        if (!RayData) continue;
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(RTA_DirectTraces);
+		for (uint32 SourceId : SourceIds)
+		{
+			TSharedPtr<FSourceRayData> RayData = FindSourceRayData(SourceId);
+			if (!RayData) continue;
 
-        FVector EmitterPosition;
-        {
-            FReadScopeLock Lock(RayData->Lock);
-            EmitterPosition = RayData->EmitterPosition;
-        }
+			FVector EmitterPosition;
+			{
+				FReadScopeLock Lock(RayData->Lock);
+				EmitterPosition = RayData->EmitterPosition;
+			}
 
-        FHitResult DirectHit;
-    	if (!World.IsValid()) return;
-    	if (!World->GetPhysicsScene() || World->GetPhysicsScene()->GetSolver() == nullptr) return;
-        const bool bBlocked = World->LineTraceSingleByChannel(DirectHit, ListenerPos, EmitterPosition, ECC_Visibility, DirectTraceParams);
+			FHitResult DirectHit;
+			if (!World.IsValid()) return;
+			if (!World->GetPhysicsScene() || World->GetPhysicsScene()->GetSolver() == nullptr) return;
+			const bool bBlocked = World->LineTraceSingleByChannel(DirectHit, ListenerPos, EmitterPosition, ECC_Visibility, DirectTraceParams);
 
-        FBandEnergy DirectEnergy; // defaults to {1,1,1} fully audible, unblocked case
+			FBandEnergy DirectEnergy; // defaults to {1,1,1} fully audible, unblocked case
 
-        if (bBlocked)
-        {
-            if (const UAcousticPhysicalMaterial* AcousticPhysMat = Cast<UAcousticPhysicalMaterial>(DirectHit.PhysMaterial.Get()))
-            {
-                if (const UAcousticMaterialAsset* Mat = AcousticPhysMat->AcousticMaterial.Get())
-                {
-                    TArrayView<const float> Transmission = Mat->GetTransmission();
-                    for (int32 Band = 0; Band < 3; ++Band)
-                    {
-                        DirectEnergy.Bands[Band] = Transmission[Band];
-                    }
-                }
-                else
-                {
-                    DirectEnergy = FBandEnergy{ {0.f, 0.f, 0.f} }; // tagged but no asset assigned: treat as fully opaque
-                }
-            }
-            else
-            {
-                DirectEnergy = FBandEnergy{ {0.f, 0.f, 0.f} }; // untagged geometry: assume fully blocking
-            }
-        }
+			if (bBlocked)
+			{
+				if (const UAcousticPhysicalMaterial* AcousticPhysMat = Cast<UAcousticPhysicalMaterial>(DirectHit.PhysMaterial.Get()))
+				{
+					if (const UAcousticMaterialAsset* Mat = AcousticPhysMat->AcousticMaterial.Get())
+					{
+						TArrayView<const float> Transmission = Mat->GetTransmission();
+						for (int32 Band = 0; Band < 3; ++Band)
+						{
+							DirectEnergy.Bands[Band] = Transmission[Band];
+						}
+					}
+					else
+					{
+						DirectEnergy = FBandEnergy{ {0.f, 0.f, 0.f} }; // tagged but no asset assigned: treat as fully opaque
+					}
+				}
+				else
+				{
+					DirectEnergy = FBandEnergy{ {0.f, 0.f, 0.f} }; // untagged geometry: assume fully blocking
+				}
+			}
 
-        const float Distance = FVector::Dist(ListenerPos, EmitterPosition);
+			const float Distance = FVector::Dist(ListenerPos, EmitterPosition);
 
-        float CutoffHz;
-        {
-            FReadScopeLock Lock(RayData->Lock);
-            const float MinDist = RayData->AirAbsorptionMinDistance;
-            const float MaxDist = FMath::Max(RayData->AirAbsorptionMaxDistance, MinDist + KINDA_SMALL_NUMBER);
-            const float Alpha = FMath::Clamp((Distance - MinDist) / (MaxDist - MinDist), 0.f, 1.f);
-            CutoffHz = FMath::Lerp(RayData->AirAbsorptionCutoffAtMinDistance, RayData->AirAbsorptionCutoffAtMaxDistance, Alpha);
-        }
+			float CutoffHz;
+			{
+				FReadScopeLock Lock(RayData->Lock);
+				const float MinDist = RayData->AirAbsorptionMinDistance;
+				const float MaxDist = FMath::Max(RayData->AirAbsorptionMaxDistance, MinDist + KINDA_SMALL_NUMBER);
+				const float Alpha = FMath::Clamp((Distance - MinDist) / (MaxDist - MinDist), 0.f, 1.f);
+				CutoffHz = FMath::Lerp(RayData->AirAbsorptionCutoffAtMinDistance, RayData->AirAbsorptionCutoffAtMaxDistance, Alpha);
+			}
 
-        ValidSourceData.Add(RayData);
-        ValidSourceIds.Add(SourceId);
-        EmitterPositions.Add(EmitterPosition);
-        bDirectLOS.Add(!bBlocked);
-        DirectTransmissionEnergy.Add(DirectEnergy);
-        AirAbsorptionCutoffHz.Add(CutoffHz);
-        BatchMaxDistance = FMath::Max(BatchMaxDistance, Distance);
-    }
+			ValidSourceData.Add(RayData);
+			ValidSourceIds.Add(SourceId);
+			EmitterPositions.Add(EmitterPosition);
+			bDirectLOS.Add(!bBlocked);
+			DirectTransmissionEnergy.Add(DirectEnergy);
+			AirAbsorptionCutoffHz.Add(CutoffHz);
+			BatchMaxDistance = FMath::Max(BatchMaxDistance, Distance);
+		}
+	}
 
     const int32 NumSources = ValidSourceData.Num();
     if (NumSources == 0) return;
@@ -231,105 +242,110 @@ void FRaytraceManager::RunAudioTrace(const TArray<uint32>& SourceIds)
 
     FCollisionQueryParams CollisionQueryParams;
     CollisionQueryParams.bReturnPhysicalMaterial = true;
+	CollisionQueryParams.bTraceComplex = true; 
+	
 
-    for (int32 RayNum = 0; RayNum < RayCount; ++RayNum)
-    {
-        TArray<bool> bConnected = bDirectLOS;
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(RTA_BounceRays);
+		for (int32 RayNum = 0; RayNum < RayCount; ++RayNum)
+		{
+			TArray<bool> bConnected = bDirectLOS;
 
-        FVector SegmentStart = ListenerPos;
-        FVector PreviousSegmentStart = ListenerPos;
-        FVector LastHitNormal = FVector::ZeroVector;
-        float LastHitScattering = 0.5f;
-        bool bHasHitSurface = false;
+			FVector SegmentStart = ListenerPos;
+			FVector PreviousSegmentStart = ListenerPos;
+			FVector LastHitNormal = FVector::ZeroVector;
+			float LastHitScattering = 0.5f;
+			bool bHasHitSurface = false;
 
-        float RayEnergy[3] = { 1.f, 1.f, 1.f };
+			float RayEnergy[3] = { 1.f, 1.f, 1.f };
 
-        for (int32 Depth = 0; Depth < MaxDepth; ++Depth)
-        {
-            FVector RandomDir;
+			for (int32 Depth = 0; Depth < MaxDepth; ++Depth)
+			{
+				FVector RandomDir;
 
-            if (!bHasHitSurface)
-            {
-                RandomDir = FMath::VRand();
-            }
-            else
-            {
-                const float ScatterRoll = FMath::FRand();
-                if (ScatterRoll < LastHitScattering)
-                {
-                    RandomDir = RandomCosineWeightedHemisphere(LastHitNormal);
-                }
-                else
-                {
-                    const FVector IncomingDir = (SegmentStart - PreviousSegmentStart).GetSafeNormal();
-                    RandomDir = FMath::GetReflectionVector(IncomingDir, LastHitNormal);
-                }
-            }
+				if (!bHasHitSurface)
+				{
+					RandomDir = FMath::VRand();
+				}
+				else
+				{
+					const float ScatterRoll = FMath::FRand();
+					if (ScatterRoll < LastHitScattering)
+					{
+						RandomDir = RandomCosineWeightedHemisphere(LastHitNormal);
+					}
+					else
+					{
+						const FVector IncomingDir = (SegmentStart - PreviousSegmentStart).GetSafeNormal();
+						RandomDir = FMath::GetReflectionVector(IncomingDir, LastHitNormal);
+					}
+				}
 
-            const FVector TraceEnd = SegmentStart + RandomDir * DynamicMaxRayLength;
+				const FVector TraceEnd = SegmentStart + RandomDir * DynamicMaxRayLength;
 
-            FHitResult HitResult;
-            World->LineTraceSingleByChannel(HitResult, SegmentStart, TraceEnd, ECC_Visibility, CollisionQueryParams);
-            if (!HitResult.IsValidBlockingHit())
-                break;
+				FHitResult HitResult;
+				World->LineTraceSingleByChannel(HitResult, SegmentStart, TraceEnd, ECC_Visibility, CollisionQueryParams);
+				if (!HitResult.IsValidBlockingHit())
+					break;
 
-            float HitScattering = 0.5f;
+				float HitScattering = 0.5f;
 
-            if (const UAcousticPhysicalMaterial* AcousticPhysMat = Cast<UAcousticPhysicalMaterial>(HitResult.PhysMaterial.Get()))
-            {
-                if (const UAcousticMaterialAsset* Mat = AcousticPhysMat->AcousticMaterial.Get())
-                {
-                    TArrayView<const float> Absorption = Mat->GetAbsorption();
-                    TArrayView<const float> Transmission = Mat->GetTransmission();
+				if (const UAcousticPhysicalMaterial* AcousticPhysMat = Cast<UAcousticPhysicalMaterial>(HitResult.PhysMaterial.Get()))
+				{
+					if (const UAcousticMaterialAsset* Mat = AcousticPhysMat->AcousticMaterial.Get())
+					{
+						TArrayView<const float> Absorption = Mat->GetAbsorption();
+						TArrayView<const float> Transmission = Mat->GetTransmission();
 
-                    for (int32 Band = 0; Band < 3; ++Band)
-                    {
-                        const float Reflected = 1.f - Absorption[Band] - Transmission[Band];
-                        RayEnergy[Band] *= FMath::Clamp(Reflected, 0.f, 1.f);
-                    }
+						for (int32 Band = 0; Band < 3; ++Band)
+						{
+							const float Reflected = 1.f - Absorption[Band] - Transmission[Band];
+							RayEnergy[Band] *= FMath::Clamp(Reflected, 0.f, 1.f);
+						}
 
-                    HitScattering = Mat->GetBakedScattering();
-                }
-            }
+						HitScattering = Mat->GetBakedScattering();
+					}
+				}
 
-            constexpr float SurfaceBias = 1.f;
-            PreviousSegmentStart = SegmentStart;
-            SegmentStart = HitResult.Location + HitResult.Normal * SurfaceBias;
-            LastHitNormal = HitResult.Normal;
-            LastHitScattering = HitScattering;
-            bHasHitSurface = true;
+				constexpr float SurfaceBias = 1.f;
+				PreviousSegmentStart = SegmentStart;
+				SegmentStart = HitResult.Location + HitResult.Normal * SurfaceBias;
+				LastHitNormal = HitResult.Normal;
+				LastHitScattering = HitScattering;
+				bHasHitSurface = true;
 
-            for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
-            {
-                if (bConnected[SrcIdx])
-                    continue;
+				for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
+				{
+					if (bConnected[SrcIdx])
+						continue;
 
-                FHitResult NEEHitResult;
-                const bool bNEEHit = World->LineTraceSingleByChannel(
-                    NEEHitResult, SegmentStart, EmitterPositions[SrcIdx], ECC_Visibility);
+					FHitResult NEEHitResult;
+					const bool bNEEHit = World->LineTraceSingleByChannel(
+						NEEHitResult, SegmentStart, EmitterPositions[SrcIdx], ECC_Visibility);
 
-                if (!bNEEHit)
-                {
-                    for (int32 Band = 0; Band < 3; ++Band)
-                    {
-                        TotalLoss[SrcIdx].Bands[Band] += (1.f - RayEnergy[Band]);
-                    }
-                    bConnected[SrcIdx] = true;
-                }
-            }
-        }
+					if (!bNEEHit)
+					{
+						for (int32 Band = 0; Band < 3; ++Band)
+						{
+							TotalLoss[SrcIdx].Bands[Band] += (1.f - RayEnergy[Band]);
+						}
+						bConnected[SrcIdx] = true;
+					}
+				}
+			}
 
-        for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
-        {
-            if (!bConnected[SrcIdx])
-            {
-                for (int32 Band = 0; Band < 3; ++Band)
-                {
-                    TotalLoss[SrcIdx].Bands[Band] += 1.f;
-                }
-            }
-        }
-    }
+			for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
+			{
+				if (!bConnected[SrcIdx])
+				{
+					for (int32 Band = 0; Band < 3; ++Band)
+					{
+						TotalLoss[SrcIdx].Bands[Band] += 1.f;
+					}
+				}
+			}
+		}
+	}
 
     constexpr float SmoothingAlpha = 0.15f;
     for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
@@ -370,6 +386,8 @@ void FRaytraceManager::RunAudioTrace(const TArray<uint32>& SourceIds)
             ValidSourceIds[SrcIdx],
             RayData->DirectTransmissionLoss[0], RayData->DirectTransmissionLoss[1], RayData->DirectTransmissionLoss[2],
             RayData->DirectLowpassCutoffHz);
+    	
+    	RayData->bTraceInFlight = false;
     }
 }
 

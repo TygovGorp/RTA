@@ -2,7 +2,7 @@
 
 #include "Containers/Ticker.h"
 
-class FRaytraceManager
+class FRaytraceManager : public TSharedFromThis<FRaytraceManager> 
 {
 public:
 	struct FSourceRayData
@@ -11,8 +11,6 @@ public:
 		{
 			DirectTransmissionLoss	= {1.f};
 			DirectLowpassCutoffHz	= 20000.f;
-			AccumulatedLoss = 0.f;
-			SuccessfulRayCount = 0; 
 			bHasValidEstimate     = false;
 			bListenerPositionSet  = false; 
 			bEmitterPositionSet   = false;
@@ -21,17 +19,15 @@ public:
 		
 		FSourceRayData(const FSourceRayData& Input)
 		{
-			DirectTransmissionLoss = Input.DirectTransmissionLoss;
-			DirectLowpassCutoffHz  = Input.DirectLowpassCutoffHz;
-			AccumulatedLoss        = Input.AccumulatedLoss;
-			SuccessfulRayCount     = Input.SuccessfulRayCount;
-			bHasValidEstimate      = Input.bHasValidEstimate;
-			bListenerPositionSet   = Input.bListenerPositionSet;
-			bEmitterPositionSet    = Input.bEmitterPositionSet;
-			EmitterPosition        = Input.EmitterPosition;
-			ListenerPosition       = Input.ListenerPosition;
-			DirtyOcclusion         = Input.DirtyOcclusion;
-			DirtyReverb            = Input.DirtyReverb;
+			DirectTransmissionLoss	= Input.DirectTransmissionLoss;
+			DirectLowpassCutoffHz	= Input.DirectLowpassCutoffHz;
+			bHasValidEstimate		= Input.bHasValidEstimate;
+			bListenerPositionSet	= Input.bListenerPositionSet;
+			bEmitterPositionSet		= Input.bEmitterPositionSet;
+			EmitterPosition			= Input.EmitterPosition;
+			ListenerPosition		= Input.ListenerPosition;
+			bDirty					= Input.bDirty;
+			bTraceInFlight			= Input.bTraceInFlight;
 			AirAbsorptionMinDistance         = Input.AirAbsorptionMinDistance;
 			AirAbsorptionMaxDistance         = Input.AirAbsorptionMaxDistance;
 			AirAbsorptionCutoffAtMinDistance = Input.AirAbsorptionCutoffAtMinDistance;
@@ -40,8 +36,6 @@ public:
 		
 		FRWLock Lock;
 		TStaticArray<float, 3> DirectTransmissionLoss = {1.f};   // 0 = fully audible, 1 = fully blocked
-		float AccumulatedLoss = 0.f;
-		int32 SuccessfulRayCount = 0; 
 		bool bHasValidEstimate     = false;
 		bool bListenerPositionSet  = false; 
 		bool bEmitterPositionSet   = false;
@@ -55,8 +49,8 @@ public:
 		float AirAbsorptionCutoffAtMinDistance = 20000.f;
 		float AirAbsorptionCutoffAtMaxDistance = 2000.f;
 		
-		bool DirtyOcclusion = true;
-		bool DirtyReverb	= true;
+		bool bDirty = true;
+		bool bTraceInFlight = false;
 	};
 	FRaytraceManager();
 	~FRaytraceManager();
@@ -81,10 +75,11 @@ private:
 	static FVector RandomCosineWeightedHemisphere(const FVector& Normal);
 	
 	FTSTicker::FDelegateHandle AudioTraceDelegateHandle;
-	float AudioTraceTickInterval = 0.033f;
-	int RayCount = 1028;
-	int MaxDepth = 8;
-	float MaxRayLength = 1000;
+	const float AudioTraceTickInterval = 0.033f;
+	const float MinPositionDeltaForDirty = 5.f;
+	const int RayCount = 1028;
+	const int MaxDepth = 8;
+	const float MaxRayLength = 1000;
 	
 	TWeakObjectPtr<UWorld> World; 
 	TMap<uint32, TSharedPtr<FSourceRayData>> Results; 
