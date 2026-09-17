@@ -50,10 +50,16 @@ void FRaytracedOcclusion::ProcessAudio(const FAudioPluginSourceInputData& InputD
     auto Results = RTManager->GetLatestResults(InputData.SourceId);
 	
     float GainBands[3];
-    for (int32 Band = 0; Band < 3; ++Band)
-    {
-        GainBands[Band] = 1.f - Results.DirectTransmissionLoss[Band];
-    }
+	if (Results.bHasValidEstimate)
+	{
+		for (int32 Band = 0; Band < 3; ++Band)
+			GainBands[Band] = 1.f - Results.DirectTransmissionLoss[Band];
+	}
+	else
+	{
+		for (int32 Band = 0; Band < 3; ++Band)
+			GainBands[Band] = 0.f; 
+	}
 
     const int32 NumSamples = InputData.AudioBuffer->Num();
     check(OutputData.AudioBuffer.Num() == NumSamples);
