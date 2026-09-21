@@ -48,18 +48,28 @@ void FRaytracedOcclusion::ProcessAudio(const FAudioPluginSourceInputData& InputD
     RTManager->UpdateEmitterPosition(InputData.SourceId, InputData.SpatializationParams->EmitterWorldPosition);
     RTManager->UpdateListenerPosition(InputData.SourceId, InputData.SpatializationParams->ListenerPosition);
     auto Results = RTManager->GetLatestResults(InputData.SourceId);
-	
-    float GainBands[3];
-	if (Results.bHasValidEstimate)
-	{
-		for (int32 Band = 0; Band < 3; ++Band)
-			GainBands[Band] = 1.f - Results.DirectTransmissionLoss[Band];
-	}
-	else
-	{
-		for (int32 Band = 0; Band < 3; ++Band)
-			GainBands[Band] = 0.f; 
-	}
+
+
+    float BandEnergy[RTA::NumBands];
+    if (Results.bHasValidEstimate)
+    {
+        for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+            BandEnergy[Band] = 1.f - Results.DirectTransmissionLoss[Band];
+    }
+    else
+    {
+        // No trace result yet. Default to fully audible
+        for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+            BandEnergy[Band] = 1.f;
+    }
+
+    const float LowEnergy  = 0.5f * (BandEnergy[0] + BandEnergy[1]);  // 125 + 250 Hz
+    const float MidEnergy  = 0.5f * (BandEnergy[2] + BandEnergy[3]);  // 500 Hz + 1 kHz
+    const float HighEnergy = 0.5f * (BandEnergy[4] + BandEnergy[5]);  // 2 kHz + 4 kHz
+
+    const float LowGain  = FMath::Sqrt(FMath::Max(LowEnergy,  0.f));
+    const float MidGain  = FMath::Sqrt(FMath::Max(MidEnergy,  0.f));
+    const float HighGain = FMath::Sqrt(FMath::Max(HighEnergy, 0.f));
 
     const int32 NumSamples = InputData.AudioBuffer->Num();
     check(OutputData.AudioBuffer.Num() == NumSamples);
@@ -76,15 +86,24 @@ void FRaytracedOcclusion::ProcessAudio(const FAudioPluginSourceInputData& InputD
     if (!FilterState)
     {
         UE_LOG(LogRTA, Warning, TEXT("No filter state for SourceId=%u, applying gain only"), InputData.SourceId);
+
+        // Broadband fallback: mean energy across all six bands, then to amplitude.
+        float MeanEnergy = 0.f;
+        for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+            MeanEnergy += BandEnergy[Band];
+        MeanEnergy /= float(RTA::NumBands);
+
+        const float BroadbandGain = FMath::Sqrt(FMath::Max(MeanEnergy, 0.f));
+
         for (int32 i = 0; i < NumSamples; ++i)
         {
-            OutputData.AudioBuffer[i] = (*InputData.AudioBuffer)[i] * GainBands[1];
+            OutputData.AudioBuffer[i] = (*InputData.AudioBuffer)[i] * BroadbandGain;
         }
         return;
     }
-	
-    constexpr float Crossover1Hz = 1000.f;  // sqrt(400 * 2500)
-    constexpr float Crossover2Hz = 6124.f;  // sqrt(2500 * 15000)
+
+    constexpr float Crossover1Hz = 354.f;   // low  / mid
+    constexpr float Crossover2Hz = 1414.f;  // mid  / high
 
     const float Alpha1 = 1.f - FMath::Exp(-2.f * PI * Crossover1Hz / SampleRate);
     const float Alpha2 = 1.f - FMath::Exp(-2.f * PI * Crossover2Hz / SampleRate);
@@ -96,18 +115,17 @@ void FRaytracedOcclusion::ProcessAudio(const FAudioPluginSourceInputData& InputD
     for (int32 i = 0; i < NumSamples; ++i)
     {
         const float Input = (*InputData.AudioBuffer)[i];
-    	
-        PrevLow = PrevLow + Alpha1 * (Input - PrevLow);          // low band
-        const float Remainder1 = Input - PrevLow;                 // mid+high
+
+        PrevLow = PrevLow + Alpha1 * (Input - PrevLow);           // low band
+        const float Remainder1 = Input - PrevLow;                 // mid + high
 
         PrevMidLP = PrevMidLP + Alpha2 * (Remainder1 - PrevMidLP);// mid band
         const float High = Remainder1 - PrevMidLP;                // high band
 
-        // Apply each band's material-driven gain, then recombine.
-        const float Occluded = (PrevLow * GainBands[0])
-                              + (PrevMidLP * GainBands[1])
-                              + (High * GainBands[2]);
-    	
+        const float Occluded = (PrevLow    * LowGain)
+                             + (PrevMidLP  * MidGain)
+                             + (High       * HighGain);
+
         PrevOutput = PrevOutput + AirAbsorptionAlpha * (Occluded - PrevOutput);
         OutputData.AudioBuffer[i] = PrevOutput;
     }

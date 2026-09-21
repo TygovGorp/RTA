@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include "CoreMinimal.h"
+#include "RTAAcousticBands.h"
 #include "Engine/DataAsset.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
 #include "Engine/DataTable.h"
@@ -60,9 +61,9 @@ public:
 	//General Input Fields
 	UPROPERTY(EditAnywhere, Category = "Transmission")
 	EConstructionType ConstructionType;
-	UPROPERTY(EditAnywhere, Category = "Transmission")
+	UPROPERTY(EditAnywhere, Category = "Transmission", meta = (ClampMin = "0.0"))
 	float Density; //kg/m^3
-	UPROPERTY(EditAnywhere, Category = "Transmission")
+	UPROPERTY(EditAnywhere, Category = "Transmission", meta = (ClampMin = "0.0"))
 	float Thickness; //m
 	UPROPERTY(EditAnywhere, Category = "Transmission")
 	float YoungsModulus; //Pa
@@ -70,8 +71,6 @@ public:
 	float PoissonsRatio;
 	UPROPERTY(EditAnywhere, Category = "Transmission")
 	EMountingCondition MountingCondition;
-	UPROPERTY(EditAnywhere, Category = "Transmission")
-	float PanelArea; //m^2
 	UPROPERTY(EditAnywhere, Category = "Transmission", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float Scattering = 0.5f;
 	
@@ -86,7 +85,7 @@ public:
 		meta = (EditCondition = "ConstructionType == EConstructionType::DoubleLeaf && UniqueSecondLeaf == true"))
 	float DensitySecondLeaf; //kg/m^3
 	UPROPERTY(EditAnywhere, Category = "Transmission",
-		meta = (EditCondition = "ConstructionType == EConstructionType::DoubleLeaf && UniqueSecondLeaf == true"))
+		meta = (EditCondition = "ConstructionType == EConstructionType::DoubleLeaf && UniqueSecondLeaf == true", ClampMin = "0.0"))
 	float ThicknessSecondLeaf; //m
 	UPROPERTY(EditAnywhere, Category = "Transmission",
 		meta = (EditCondition = "ConstructionType == EConstructionType::DoubleLeaf && UniqueSecondLeaf == true"))
@@ -107,12 +106,12 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Absorption")
 	bool bOverrideAbsorption = false;
 
-	UPROPERTY(EditAnywhere, Category = "Absorption", meta = (EditCondition = "bOverrideAbsorption"))
-	float OverrideAbsorption[3] = { 0.f, 0.f, 0.f };
+	UPROPERTY(EditAnywhere, Category = "Absorption", meta = (EditCondition = "bOverrideAbsorption", ClampMin = "0.0", ClampMax = "1.0"))
+	float OverrideAbsorption[RTA::NumBands] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
 #endif
 	
-	TArrayView<const float> GetTransmission() const { return TArrayView(Transmission, 3); }
-	TArrayView<const float> GetAbsorption()  const { return TArrayView(Absorption, 3); }
+	TArrayView<const float> GetTransmission() const { return TArrayView(Transmission, RTA::NumBands); }
+	TArrayView<const float> GetAbsorption()  const { return TArrayView(Absorption, RTA::NumBands); }
 	float GetBakedScattering()  const { return BakedScattering; }
 
 private:
@@ -127,17 +126,11 @@ private:
 	float GetMassAirMassPenalty() const;
 #endif
 	
-	TStaticArray<int, 3> FrequencyBands = {
-		400,
-		2500,
-		15000
-	};
-	
 	//Baked Output
 	UPROPERTY(VisibleAnywhere, Category = "Baked")
-	float Transmission[3];
+	float Transmission[RTA::NumBands] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
 	UPROPERTY(VisibleAnywhere, Category = "Baked")
-	float Absorption[3];
+	float Absorption[RTA::NumBands] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
 	UPROPERTY(VisibleAnywhere, Category = "Baked")
 	float BakedScattering = 0.5f;
 };

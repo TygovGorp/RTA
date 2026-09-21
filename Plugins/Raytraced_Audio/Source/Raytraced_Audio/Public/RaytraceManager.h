@@ -1,21 +1,16 @@
 ﻿#pragma once
 
+#include "RTAAcousticBands.h"
 #include "Containers/Ticker.h"
+
+class UAcousticMaterialAsset;
 
 class FRaytraceManager : public TSharedFromThis<FRaytraceManager> 
 {
 public:
 	struct FSourceRayData
 	{
-		FSourceRayData()
-		{
-			DirectTransmissionLoss	= {1.f};
-			DirectLowpassCutoffHz	= 20000.f;
-			bHasValidEstimate     = false;
-			bListenerPositionSet  = false; 
-			bEmitterPositionSet   = false;
-			//ReverbPaths				= TArray<FBouncePathResult>();
-		}
+		FSourceRayData() {}
 		
 		FSourceRayData(const FSourceRayData& Input)
 		{
@@ -35,7 +30,7 @@ public:
 		}
 		
 		FRWLock Lock;
-		TStaticArray<float, 3> DirectTransmissionLoss = {1.f};   // 0 = fully audible, 1 = fully blocked
+		TStaticArray<float, RTA::NumBands> DirectTransmissionLoss = {1.f, 1.f, 1.f, 1.f, 1.f, 1.f};   // 0 = fully audible, 1 = fully blocked
 		bool bHasValidEstimate     = false;
 		bool bListenerPositionSet  = false; 
 		bool bEmitterPositionSet   = false;
@@ -52,6 +47,20 @@ public:
 		bool bDirty = true;
 		bool bTraceInFlight = false;
 	};
+	
+	struct FBandEnergy { float Bands[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f }; };
+	struct FLossAccumulator { float Bands[RTA::NumBands] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f }; };
+	
+	struct FValidData
+	{
+		TSharedPtr<FSourceRayData> SourceData;
+		uint32 SourceId;
+		FVector EmitterPos;
+		bool DirectLOS;
+		FBandEnergy DirectTransmissionEnergy;
+		float AirAbsorptionCutoffHz;
+	};
+	
 	FRaytraceManager();
 	~FRaytraceManager();
 
@@ -69,10 +78,14 @@ public:
 private:
 	bool TickAudioTrace(float DeltaTime);
 	TSharedPtr<FSourceRayData> FindSourceRayData(uint32 SourceId);
+	void TraceWriteBack(TArray<FValidData> ValidData,TArray<FLossAccumulator> TotalLoss, float SmoothingAlpha, int32 SrcIdx) const;
 
-	void RunAudioTrace(const TArray<uint32>& SourceIds);  
+	void RunAudioTrace(const TArray<uint32>& SourceIds, uint32 TraceSeed);  
+	void BounceRaysTrace(const FVector& ListenerPos, TArray<FValidData>& ValidData, const uint32& TraceSeed, const float& DynamicMaxRayLength, int32
+	                     NumSources, TArray<FLossAccumulator>& TotalLoss);
 	
-	static FVector RandomCosineWeightedHemisphere(const FVector& Normal);
+	static FVector RandomCosineWeightedHemisphere(const FVector& Normal, FRandomStream& RndStrm);
+	const UAcousticMaterialAsset* GetAcousticMaterialAsset(const FHitResult& HitResult);
 	
 	FTSTicker::FDelegateHandle AudioTraceDelegateHandle;
 	const float AudioTraceTickInterval = 0.033f;
@@ -80,6 +93,7 @@ private:
 	const int RayCount = 1028;
 	const int MaxDepth = 8;
 	const float MaxRayLength = 1000;
+	FThreadSafeCounter ThreadSafeCounter;
 	
 	TWeakObjectPtr<UWorld> World; 
 	TMap<uint32, TSharedPtr<FSourceRayData>> Results; 

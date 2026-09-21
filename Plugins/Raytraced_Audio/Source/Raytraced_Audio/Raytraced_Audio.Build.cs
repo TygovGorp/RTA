@@ -36,6 +36,7 @@ public class Raytraced_Audio : ModuleRules
 			{
 				"Slate",
 				"SlateCore",
+				"SignalProcessing"
 				// ... add private dependencies that you statically link with here ...	
 			}
 			);
