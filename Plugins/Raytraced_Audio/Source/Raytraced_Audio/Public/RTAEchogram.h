@@ -24,16 +24,20 @@ public:
 	int32 LastNonZeroBin(int32 Band);
 	double BandTotal(int32 Band);
 	
+	float GetBinWidthSeconds() const {return BinWidthSeconds;}
+	float GetNumBins() const {return NumBins;}
+	float GetMaxTimeSeconds() const {return MaxTimeSeconds;}
+	float GetSize() const {return Size;}
 	float GetSmoothingAlpha() const {return SmoothingAlpha;}
 private:
 	TArray<float> Echogram;
 	
-	constexpr float BinWidthSeconds = 0.001f;   // 1 ms per slot
-	constexpr int32 NumBins         = 3000;     // 3 s of tail
-	constexpr float MaxTimeSeconds  = BinWidthSeconds * NumBins;
+	const float BinWidthSeconds = 0.001f;   // 1 ms per slot
+	const int32 NumBins         = 3000;     // 3 s of tail
+	const float MaxTimeSeconds  = BinWidthSeconds * NumBins;
 
-	constexpr int32 Size = RTA::NumBands * NumBins;
+	const int32 Size = RTA::NumBands * NumBins;
 
-	constexpr float SmoothingAlpha = 0.1f;
+	const float SmoothingAlpha = 0.1f;
 
 };

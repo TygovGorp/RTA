@@ -769,8 +769,8 @@ void FRaytraceManager::RunRoomProbe(uint32 TraceSeed)
 			AdaptiveMaxRayLength.load(std::memory_order_relaxed),
 			Published.EyringRT60[0], Published.EyringRT60[1], Published.EyringRT60[2],
 			Published.EyringRT60[3], Published.EyringRT60[4], Published.EyringRT60[5],
-			RTA::EchogramBandTotal(Listener->AccumulatedEchogram, 3),
-			RTA::EchogramLastNonZeroBin(Listener->AccumulatedEchogram, 3));
+			Listener->AccumulatedEchogram.BandTotal(3),
+			Listener->AccumulatedEchogram.LastNonZeroBin(3));
 	}
 }
 
@@ -813,13 +813,13 @@ void FRaytraceManager::DumpEchogramCsv() const
 
 	{
 		FReadScopeLock Lock(Listener->Lock);
-		for (int32 Bin = 0; Bin < RTA::NumBins; ++Bin)
+		for (int32 Bin = 0; Bin < Listener->AccumulatedEchogram.GetNumBins(); ++Bin)
 		{
-			Csv += FString::Printf(TEXT("%d,%.1f"), Bin, Bin * RTA::BinWidthSeconds * 1000.f);
+			Csv += FString::Printf(TEXT("%d,%.1f"), Bin, Bin * Listener->AccumulatedEchogram.GetBinWidthSeconds() * 1000.f);
 			for (int32 Band = 0; Band < RTA::NumBands; ++Band)
 			{
 				Csv += FString::Printf(TEXT(",%.9e"),
-					Listener->AccumulatedEchogram[RTA::EchogramIndex(Band, Bin)]);
+					Listener->AccumulatedEchogram[Listener->AccumulatedEchogram.Index(Band, Bin)]);
 			}
 			Csv += LINE_TERMINATOR;
 		}
