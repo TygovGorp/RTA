@@ -1,66 +1,101 @@
-﻿#pragma once
+#pragma once
 
 #include "RTAAcousticBands.h"
+#include "RTAEchogram.h"
+#include "RTASeqLock.h"
 #include "Containers/Ticker.h"
+#include "Engine/HitResult.h"
+#include "Math/RandomStream.h"
+#include <atomic>
 
 class UAcousticMaterialAsset;
+class UWorld;
 
-class FRaytraceManager : public TSharedFromThis<FRaytraceManager> 
+class FRaytraceManager : public TSharedFromThis<FRaytraceManager>
 {
 public:
+	struct FSourceResult
+	{
+		float DirectTransmissionLoss[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f }; // 0 = audible, 1 = blocked
+		float DirectLowpassCutoffHz = 20000.f;
+		bool  bHasValidEstimate = false;
+	};
+
+	struct FRoomResult
+	{
+		float EyringRT60[RTA::NumBands] = {};
+		float MeanAbsorption[RTA::NumBands] = {};
+		float MeanFreePathMetres = 0.f;
+		float EscapedRayFraction = 0.f;
+		float MeanBounceDepth = 0.f;
+		bool  bHasValidEstimate = false;
+	};
+
 	struct FSourceRayData
 	{
-		FSourceRayData() {}
-		
-		FSourceRayData(const FSourceRayData& Input)
-		{
-			DirectTransmissionLoss	= Input.DirectTransmissionLoss;
-			DirectLowpassCutoffHz	= Input.DirectLowpassCutoffHz;
-			bHasValidEstimate		= Input.bHasValidEstimate;
-			bListenerPositionSet	= Input.bListenerPositionSet;
-			bEmitterPositionSet		= Input.bEmitterPositionSet;
-			EmitterPosition			= Input.EmitterPosition;
-			ListenerPosition		= Input.ListenerPosition;
-			bDirty					= Input.bDirty;
-			bTraceInFlight			= Input.bTraceInFlight;
-			AirAbsorptionMinDistance         = Input.AirAbsorptionMinDistance;
-			AirAbsorptionMaxDistance         = Input.AirAbsorptionMaxDistance;
-			AirAbsorptionCutoffAtMinDistance = Input.AirAbsorptionCutoffAtMinDistance;
-			AirAbsorptionCutoffAtMaxDistance = Input.AirAbsorptionCutoffAtMaxDistance;
-		}
-		
+		FSourceRayData() = default;
+
 		FRWLock Lock;
-		TStaticArray<float, RTA::NumBands> DirectTransmissionLoss = {1.f, 1.f, 1.f, 1.f, 1.f, 1.f};   // 0 = fully audible, 1 = fully blocked
-		bool bHasValidEstimate     = false;
-		bool bListenerPositionSet  = false; 
-		bool bEmitterPositionSet   = false;
-		float DirectLowpassCutoffHz = 20000.f;
-		FVector EmitterPosition = FVector(0);
-		FVector ListenerPosition = FVector(0);
-		//TArray<FBouncePathResult> ReverbPaths; // hit points/materials from bounce rays
 		
+		FVector EmitterPosition = FVector::ZeroVector;
+		bool bEmitterPositionSet = false;
+		bool bDirty = true;
+		bool bTraceInFlight = false;
+
+		float DirectTransmissionLoss[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
+		float DirectLowpassCutoffHz = 20000.f;
+		bool  bHasValidEstimate = false;
+
 		float AirAbsorptionMinDistance = 300.f;
 		float AirAbsorptionMaxDistance = 5000.f;
 		float AirAbsorptionCutoffAtMinDistance = 20000.f;
 		float AirAbsorptionCutoffAtMaxDistance = 2000.f;
-		
-		bool bDirty = true;
-		bool bTraceInFlight = false;
+
+		TRTASeqLock<FSourceResult> Result;
 	};
-	
-	struct FBandEnergy { float Bands[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f }; };
-	struct FLossAccumulator { float Bands[RTA::NumBands] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f }; };
-	
+
+	struct FListenerData
+	{
+		FRWLock Lock;
+
+		FVector Position = FVector::ZeroVector;
+		bool bPositionSet = false;
+		bool bDirty = true;
+
+		FEchogram FreshEchogram;
+		FEchogram AccumulatedEchogram;
+
+		int32 ProbeCount = 0;
+
+		float EyringRT60[RTA::NumBands] = {};
+		float MeanAbsorption[RTA::NumBands] = {};
+		float MeanFreePathMetres = 0.f;
+		float EscapedRayFraction = 0.f;
+		float MeanBounceDepth = 0.f;
+		bool  bHasValidEstimate = false;
+
+		TRTASeqLock<FRoomResult> Result;
+	};
+
 	struct FValidData
 	{
 		TSharedPtr<FSourceRayData> SourceData;
-		uint32 SourceId;
-		FVector EmitterPos;
-		bool DirectLOS;
-		FBandEnergy DirectTransmissionEnergy;
-		float AirAbsorptionCutoffHz;
+		uint32 SourceId = 0;
+		FVector EmitterPos = FVector::ZeroVector;
+		bool bDirectLOS = false;
+		float DirectTransmissionEnergy[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
+		float AirAbsorptionCutoffHz = 20000.f;
 	};
-	
+
+	struct FLossAccumulator { float Bands[RTA::NumBands] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f }; };
+
+	struct FSurfaceAcoustics
+	{
+		float Reflected[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
+		float Absorption[RTA::NumBands] = {};
+		float Scattering = RTA::DefaultScattering;
+	};
+
 	FRaytraceManager();
 	~FRaytraceManager();
 
@@ -70,32 +105,75 @@ public:
 		float AirAbsorptionCutoffAtMinDistance = 20000.f,
 		float AirAbsorptionCutoffAtMaxDistance = 2000.f);
 	void UnregisterSource(uint32 SourceId);
-	void UpdateEmitterPosition(uint32 SourceId, const FVector& Position); 
-	void UpdateListenerPosition(uint32 SourceId, const FVector& Position); 
-	FSourceRayData GetLatestResults(uint32 SourceId);
-	
+
+	void UpdateEmitterPosition(uint32 SourceId, const FVector& Position);
+
+	void UpdateListenerPosition(const FVector& Position);
+
+	FSourceResult GetLatestResults(uint32 SourceId) const;
+	FRoomResult   GetLatestRoomResult() const;
+
 	void SetWorld(UWorld* WorldIn) { this->World = WorldIn; }
+
+	void DumpEchogramCsv() const;
+
 private:
 	bool TickAudioTrace(float DeltaTime);
-	TSharedPtr<FSourceRayData> FindSourceRayData(uint32 SourceId);
-	void TraceWriteBack(TArray<FValidData> ValidData,TArray<FLossAccumulator> TotalLoss, float SmoothingAlpha, int32 SrcIdx) const;
+	void RunAudioTrace(const TArray<uint32>& SourceIds, uint32 TraceSeed);
+	bool GatherDirectData(const FVector& ListenerPos, const TArray<uint32>& SourceIds,
+	                      TArray<FValidData>& OutValidData) const;
+	void BounceRaysTrace(const FVector& ListenerPos, const TArray<FValidData>& ValidData,
+	                     uint32 TraceSeed, TArray<FLossAccumulator>& TotalLoss) const;
+	void TraceWriteBack(const TArray<FValidData>& ValidData,
+	                    const TArray<FLossAccumulator>& TotalLoss, int32 SrcIdx) const;
 
-	void RunAudioTrace(const TArray<uint32>& SourceIds, uint32 TraceSeed);  
-	void BounceRaysTrace(const FVector& ListenerPos, TArray<FValidData>& ValidData, const uint32& TraceSeed, const float& DynamicMaxRayLength, int32
-	                     NumSources, TArray<FLossAccumulator>& TotalLoss);
-	
+	bool TickRoomProbe(float DeltaTime);
+	void RunRoomProbe(uint32 TraceSeed);
+	static void ComputeEyringRT60(float MeanFreePathMetres,
+	                              const float MeanAbsorption[RTA::NumBands],
+	                              float OutRT60[RTA::NumBands]);
+
+	TSharedPtr<FSourceRayData> FindSourceRayData(uint32 SourceId) const;
+	bool IsWorldTraceable() const;
+	static FVector SampleBounceDirection(bool bHasHitSurface, const FVector& SegmentStart,
+	                                     const FVector& PreviousSegmentStart,
+	                                     const FVector& LastHitNormal, float LastHitScattering,
+	                                     FRandomStream& RndStrm);
 	static FVector RandomCosineWeightedHemisphere(const FVector& Normal, FRandomStream& RndStrm);
-	const UAcousticMaterialAsset* GetAcousticMaterialAsset(const FHitResult& HitResult);
-	
+	static FSurfaceAcoustics ResolveSurface(const FHitResult& HitResult);
+
 	FTSTicker::FDelegateHandle AudioTraceDelegateHandle;
-	const float AudioTraceTickInterval = 0.033f;
-	const float MinPositionDeltaForDirty = 5.f;
-	const int RayCount = 1028;
-	const int MaxDepth = 8;
-	const float MaxRayLength = 1000;
-	FThreadSafeCounter ThreadSafeCounter;
-	
-	TWeakObjectPtr<UWorld> World; 
-	TMap<uint32, TSharedPtr<FSourceRayData>> Results; 
-	FRWLock ResultsLock;
+	FTSTicker::FDelegateHandle RoomProbeDelegateHandle;
+
+	static constexpr float AudioTraceTickInterval = 0.033f;
+	static constexpr float RoomProbeTickInterval  = 0.25f;
+	static constexpr float MinPositionDeltaForDirty = 5.f;
+
+	static constexpr int32 RayCount = 1028;
+	static constexpr int32 OcclusionMaxDepth = 8;
+	static constexpr int32 ProbeMaxDepth = 64;
+	static constexpr int32 RouletteStartDepth = 10;
+	static constexpr float RouletteQMin = 0.05f;
+	static constexpr float RouletteQMax = 0.95f;
+	static constexpr float EnergyFloor = 1.0e-6f;
+
+	static constexpr float SurfaceBiasCm = 1.f;
+	static constexpr float RayLengthHeadroom = 2.0f;
+	static constexpr float RayLengthSmoothing = 0.2f;
+	static constexpr float MinAdaptiveRayLength = 1000.f;    //  10 m
+	static constexpr float MaxAdaptiveRayLength = 20000.f;   // 200 m
+	static constexpr float OcclusionSmoothingAlpha = 0.15f;
+
+	std::atomic<float> AdaptiveMaxRayLength{ 3000.f };
+
+	std::atomic<bool> bAudioTraceRunning{ false };
+	std::atomic<bool> bRoomProbeRunning{ false };
+
+	FThreadSafeCounter TraceCounter;
+
+	TWeakObjectPtr<UWorld> World;
+	TMap<uint32, TSharedPtr<FSourceRayData>> Results;
+	mutable FRWLock ResultsLock;
+
+	TSharedPtr<FListenerData> Listener;
 };

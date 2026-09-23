@@ -3,25 +3,6 @@
 #include "AssetTypeCategories.h"
 #include "RTAOcclusionSourceSettings.h"
 
-URTAReverbSourceSettingsFactory::URTAReverbSourceSettingsFactory()
-{
-	//SupportedClass = URTAReverbSourceSettings::StaticClass();
-	//bCreateNew = true;
-	//bEditAfterNew = true;
-}
-
-UObject* URTAReverbSourceSettingsFactory::FactoryCreateNew(
-	UClass* InClass, UObject* InParent, FName InName, EObjectFlags Flags,
-	UObject* /*Context*/, FFeedbackContext* /*Warn*/)
-{
-	return nullptr; //NewObject<URTAReverbSourceSettings>(InParent, InName, Flags);
-}
-
-uint32 URTAReverbSourceSettingsFactory::GetMenuCategories() const
-{
-	return EAssetTypeCategories::Sounds;
-}
-
 URTAOcclusionSourceSettingsFactory::URTAOcclusionSourceSettingsFactory()
 {
 	SupportedClass = URTAOcclusionSourceSettings::StaticClass();

@@ -1,34 +1,8 @@
 #include "RTAAssetDefinitions.h"
 
 #include "RTAOcclusionSourceSettings.h"
+
 #define LOCTEXT_NAMESPACE "RTAAssetDefinitions"
-
-// --- Reverb ------------------------------------------------------------------------
-
-FText UAssetDefinition_RTAReverbSourceSettings::GetAssetDisplayName() const
-{
-	return LOCTEXT("RTAReverbSourceSettings", "Raytraced Reverb Source Settings");
-}
-
-FLinearColor UAssetDefinition_RTAReverbSourceSettings::GetAssetColor() const
-{
-	return FLinearColor(FColor(97, 85, 212));
-}
-
-TSoftClassPtr<UObject> UAssetDefinition_RTAReverbSourceSettings::GetAssetClass() const
-{
-	return nullptr;
-}
-
-TConstArrayView<FAssetCategoryPath> UAssetDefinition_RTAReverbSourceSettings::GetAssetCategories() const
-{
-	// Lands directly under Audio. To nest it the way Resonance does (Audio/Advanced),
-	// build an FAssetCategoryPath with a subcategory instead.
-	static const auto Categories = { EAssetCategoryPaths::Audio };
-	return Categories;
-}
-
-// --- Occlusion ---------------------------------------------------------------------
 
 FText UAssetDefinition_RTAOcclusionSourceSettings::GetAssetDisplayName() const
 {
