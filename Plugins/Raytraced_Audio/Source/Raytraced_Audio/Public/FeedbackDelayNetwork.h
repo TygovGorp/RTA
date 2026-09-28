@@ -43,10 +43,7 @@ public:
 
 private:
 	static int32 NearestPrimeAtLeast(int32 Wanted);
-
-	// 16 lines rather than 8. The number of distinct recirculation paths is what sets echo
-	// density, and at 8 the early tail is sparse enough to hear as a metallic ring rather
-	// than a diffuse wash. Must remain a power of two: the Hadamard transform requires it.
+	
 	static constexpr int32 NumLines = 16;
 
 	static constexpr float MaxPredelaySeconds = 0.2f;
@@ -55,14 +52,10 @@ private:
 
 	TStaticArray<FRTADelayLine, NumLines> Lines;
 	TStaticArray<float, NumLines> Gain, TargetGain, DelaySeconds, FilterZ1, Feed;
-
-	// Predelay sits in front of the network, so the tail starts after the first reflection
-	// would have arrived instead of on top of the dry sound.
+	
 	FRTADelayLine Predelay;
 	int32 PredelaySamples = 0;
-
-	// Damping ramps per block like the gains do. Stepping a filter coefficient each time a
-	// 4 Hz probe lands is audible as a click when moving between rooms.
+	
 	float Damping = 0.f, TargetDamping = 0.f;
 	float SampleRate = 48000.f;
 };

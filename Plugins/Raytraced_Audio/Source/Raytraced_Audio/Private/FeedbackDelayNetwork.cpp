@@ -3,9 +3,7 @@
 void FFeedbackDelayNetwork::Init(float InSampleRate)
 {
 	SampleRate = InSampleRate > 0.f ? InSampleRate : 48000.f;
-
-	// Primes spanning roughly 19 to 97 ms at 48 kHz. Spread around a typical mean free path
-	// rather than clustered, and mutually prime so their echoes rarely coincide.
+	
 	static constexpr int32 BasePrimes[NumLines] = {
 		 911, 1087, 1201, 1373, 1459, 1607, 1777, 1949,
 		2131, 2309, 2503, 2687, 2909, 3121, 3323, 3761
@@ -13,8 +11,6 @@ void FFeedbackDelayNetwork::Init(float InSampleRate)
 
 	for (int32 i = 0; i < NumLines; ++i)
 	{
-		// Re-pick the nearest prime after scaling: multiplying a prime by a rate ratio
-		// usually lands on a composite, which would break the coprimality.
 		const int32 Wanted = FMath::RoundToInt(BasePrimes[i] * SampleRate / 48000.f);
 		const int32 Len = NearestPrimeAtLeast(Wanted);
 
@@ -50,8 +46,6 @@ void FFeedbackDelayNetwork::SetPredelaySeconds(float Seconds)
 	const float Clamped = FMath::Clamp(Seconds, 0.f, MaxPredelaySeconds);
 	const int32 Wanted = FMath::RoundToInt(Clamped * SampleRate);
 
-	// Changing the read distance mid-tail would click, so only move it when the difference
-	// is worth it. 5 ms is below the threshold at which predelay is perceptible.
 	if (FMath::Abs(Wanted - PredelaySamples) * (1.f / SampleRate) > 0.005f)
 	{
 		PredelaySamples = FMath::Clamp(Wanted, 0, Predelay.Buffer.Num() - 1);
@@ -60,9 +54,6 @@ void FFeedbackDelayNetwork::SetPredelaySeconds(float Seconds)
 
 void FFeedbackDelayNetwork::SetDecayFromBands(const float RT60PerBand[6])
 {
-	// Broadband target from the mid bands: 500 Hz and 1 kHz carry most of the perceived
-	// decay length and avoid both the air-absorption rolloff and the low bands where the
-	// tracer is least reliable.
 	const float MidRT60 = 0.5f * (RT60PerBand[2] + RT60PerBand[3]);
 	SetRT60(MidRT60);
 
@@ -74,13 +65,9 @@ void FFeedbackDelayNetwork::SetDecayFromBands(const float RT60PerBand[6])
 		SetDamping(0.f);
 		return;
 	}
-
-	// Highs ringing longer than lows is not something a real room does, nor something this
-	// filter can produce. Clamp rather than pretend.
+	
 	const float Ratio = FMath::Clamp(HighRT60 / LowRT60, 0.05f, 1.f);
 
-	// The one-pole is unity at DC and (1-d)/(1+d) at Nyquist, so it leaves the low end alone
-	// and shortens the top. Solve for the d that produces the measured high/low ratio.
 	const float T = GetMeanDelaySeconds();
 	const float MeanGain = FMath::Pow(10.f, -3.f * T / FMath::Max(MidRT60, KINDA_SMALL_NUMBER));
 	const float G = FMath::Loge(FMath::Max(MeanGain, KINDA_SMALL_NUMBER));
@@ -103,7 +90,7 @@ void FFeedbackDelayNetwork::Reset()
 		Lines[i].Reset();
 		FilterZ1[i] = 0.f;
 		Feed[i] = 0.f;
-		Gain[i] = TargetGain[i];   // snap on reset, never ramp
+		Gain[i] = TargetGain[i];
 	}
 	Predelay.Reset();
 	Damping = TargetDamping;
@@ -111,8 +98,6 @@ void FFeedbackDelayNetwork::Reset()
 
 float FFeedbackDelayNetwork::ProcessSample(float In)
 {
-	// Delay the input before it reaches the network. Reading at PredelaySamples behind the
-	// write head gives a shorter delay than the buffer length without resizing anything.
 	const int32 BufLen = Predelay.Buffer.Num();
 	Predelay.Buffer[Predelay.WriteIndex] = In;
 	const int32 ReadIndex = (Predelay.WriteIndex + BufLen - PredelaySamples) % BufLen;
@@ -167,7 +152,6 @@ void FFeedbackDelayNetwork::ProcessBlock(const float* In, float* Out, int32 NumF
 		Out[n] = ProcessSample(In[n]);
 	}
 
-	// Land exactly on the target so ramp rounding cannot accumulate across blocks.
 	for (int32 i = 0; i < NumLines; ++i) Gain[i] = TargetGain[i];
 	Damping = TargetDamping;
 }
@@ -202,7 +186,6 @@ void FFeedbackDelayNetwork::FastHadamard(TStaticArray<float, NumLines>& V)
 		}
 	}
 
-	// Without this the matrix has gain sqrt(NumLines) per pass and the network runs away.
 	const float Scale = 1.f / FMath::Sqrt(float(NumLines));
 	for (int32 i = 0; i < NumLines; ++i) V[i] *= Scale;
 }

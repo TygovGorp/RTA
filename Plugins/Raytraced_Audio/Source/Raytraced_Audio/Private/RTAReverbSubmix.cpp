@@ -16,9 +16,7 @@ void FRTAReverbSubmix::OnPresetChanged()
 {
 	GET_EFFECT_SETTINGS(RTAReverbSubmix);
 	OutputGain = Settings.OutputGain;
-
-	// Only the preset drives decay until the room probe reports; after that SetRoomDecay owns
-	// it, so a preset edit must not stomp a live measurement.
+	
 	if (!bRoomDecayApplied)
 	{
 		FDN.SetRT60(Settings.RT60Seconds);
@@ -28,8 +26,6 @@ void FRTAReverbSubmix::OnPresetChanged()
 
 void FRTAReverbSubmix::SetRoomDecay(const float RT60PerBand[6], float PredelaySeconds)
 {
-	// Predelay has its own threshold inside the FDN and can move independently of the decay,
-	// so it must not sit behind the decay early-out below.
 	FDN.SetPredelaySeconds(PredelaySeconds);
 
 	bool bRoomDelayAppliedChanged = !bRoomDecayApplied;

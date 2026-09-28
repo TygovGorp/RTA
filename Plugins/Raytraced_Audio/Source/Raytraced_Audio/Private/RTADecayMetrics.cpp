@@ -129,8 +129,8 @@ FDecayMetric ComputeDecayMetrics(const FEchogram& Echogram, int32 Band)
 	float RefSlope = 0.f, RefR = 0.f;
 	if (FitDecay(Curve, 0.f, -10.f, FEchogram::NumBins - 1, RefSlope, RefR))
 	{
-		constexpr int32 WindowBins = 100;                 // 100 ms
-		constexpr float SteepnessLimit = 1.25f;           // ~1 dB truncation bias
+		constexpr int32 WindowBins = 100;
+		constexpr float SteepnessLimit = 1.25f;
 
 		for (int32 Bin = WindowBins; Bin < FEchogram::NumBins; ++Bin)
 		{
@@ -139,7 +139,7 @@ FDecayMetric ComputeDecayMetrics(const FEchogram& Echogram, int32 Band)
 			if (A <= -FLT_MAX * 0.5f || B <= -FLT_MAX * 0.5f) { LastValidBin = Bin - WindowBins; break; }
 
 			const float LocalSlope = (B - A) / (WindowBins * FEchogram::BinWidthSeconds);
-			if (LocalSlope < RefSlope * SteepnessLimit)    // more negative = steeper
+			if (LocalSlope < RefSlope * SteepnessLimit)
 			{
 				LastValidBin = Bin - WindowBins;
 				break;

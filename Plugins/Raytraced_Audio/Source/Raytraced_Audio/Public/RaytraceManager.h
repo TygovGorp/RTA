@@ -23,10 +23,6 @@ public:
 
 	struct FRoomResult
 	{
-		// Measured from the echogram. T30 is the better estimate but can legitimately be
-		// unavailable when the window is too short for the room, so consumers must fall back.
-		// Listener -> nearest surface -> listener, so a room-scale figure rather than a true
-		// per-source predelay, which would need the source position the probe does not have.
 		float FirstReflectionSeconds = 0.f;
 
 		float MeasuredT30[RTA::NumBands] = {};

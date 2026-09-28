@@ -596,7 +596,7 @@ void FRaytraceManager::RunRoomProbe(uint32 TraceSeed)
 	double AbsorptionSum[RTA::NumBands] = {};
 	int32  HitCount = 0;
 	int32  EscapedRays = 0;
-	float  MaxHitDistanceCm = 0.f;   // diagnostic only; feeds nothing
+	float  MaxHitDistanceCm = 0.f;
 
 	FRandomStream RndStrm;
 
@@ -773,8 +773,6 @@ void FRaytraceManager::RunRoomProbe(uint32 TraceSeed)
 			Published.bT20Valid[Band]   = DecayMetrics[Band].bT20Valid;
 		}
 		{
-			// 1 kHz: the densest band, so the least likely to report a spuriously late first
-			// arrival from a bin that simply has not been filled yet.
 			const int32 FirstBin = Listener->AccumulatedEchogram.FirstNonZeroBin(3);
 			Published.FirstReflectionSeconds = (FirstBin > 0)
 				? float(FirstBin) * FEchogram::BinWidthSeconds

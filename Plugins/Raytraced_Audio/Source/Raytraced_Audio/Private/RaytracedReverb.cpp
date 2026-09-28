@@ -154,9 +154,6 @@ void FRaytracedReverb::UpdateRoomDecay()
 	float RT60[RTA::NumBands];
 	for (int32 Band = 0; Band < RTA::NumBands; ++Band)
 	{
-		// T30 is the better estimate but can be unmeasurable when the window is too short for
-		// the room, so fall back rather than feeding an invalid zero into SetRT60, which would
-		// clamp to 0.05 s and produce an obviously wrong tiny room.
 		float Value = Room.EyringRT60[Band];
 		if (GRTARt60Source != 0)
 		{
@@ -207,14 +204,6 @@ void FRaytracedReverb::ProcessSourceAudio(const FAudioPluginSourceInputData& Inp
 		return;
 	}
 
-	// How much of this source actually reaches the room.
-	//
-	// Distance: direct energy falls as 1/r^2 while the reverberant field is roughly uniform,
-	// so the send is held flat and the wet/dry ratio rises naturally with distance as the dry
-	// path attenuates. Nothing to do here beyond a near-field guard.
-	//
-	// Occlusion: a source behind a wall feeds the room less. DirectTransmissionLoss is already
-	// smoothed by the occlusion pass.
 	float Energy = 1.f;
 	if (RTManager.IsValid())
 	{
@@ -230,8 +219,6 @@ void FRaytracedReverb::ProcessSourceAudio(const FAudioPluginSourceInputData& Inp
 		}
 	}
 
-	// Energy in the model, amplitude in the buffer. Without this sqrt the send is attenuated
-	// twice as hard in dB as intended, which is the bug the occlusion path had.
 	const float SendGain = State ? State->SendGain : 1.f;
 	const float TargetSend = FMath::Sqrt(Energy) * SendGain;
 
