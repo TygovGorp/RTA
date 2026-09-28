@@ -19,7 +19,7 @@ public class Raytraced_AudioEditor : ModuleRules
 		{
 			"UnrealEd",
 			"AssetTools",
-			"AssetDefinition",   // <-- added: required by UAssetDefinitionDefault
+			"AssetDefinition",
 			"Slate",
 			"SlateCore"
 		});

@@ -2,6 +2,7 @@
 #include "AudioDevice.h"
 #include "RaytracedReverb.h"
 #include "RaytraceManager.h"
+#include "RTAReverbSourceSettings.h"
 
 class FRaytracedReverbFactory : public IAudioReverbFactory
 {
@@ -17,7 +18,7 @@ public:
 		
 		return MakeShared<FRaytracedReverb>(Manager);
 	}
-	
+	virtual UClass* GetCustomReverbSettingsClass() const override { return URTAReverbSourceSettings::StaticClass(); }
 	void SetAudioPluginListenerPtr(TAudioPluginListenerPtr Ptr) { AudioPluginListenerPtr = Ptr; }
 	void SetRTManagerMapPtr(TMap<FAudioDevice*, TSharedPtr<FRaytraceManager>>* Ptr) { RTManagerMapPtr = Ptr; }
 	

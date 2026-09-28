@@ -41,4 +41,6 @@ namespace RTA
 	inline constexpr float ReceiverRadiusCm = 10.f;
 	inline constexpr float MinReceiverDistanceCm = 50.f;
 
+	// Reverb
+	inline constexpr int32 MaxFramesPerBlock = 1024;
 }

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "RTAAcousticBands.h"
-#include "RTAEchogram.h"
+#include "Echogram.h"
 #include "RTASeqLock.h"
 #include "Containers/Ticker.h"
 #include "Engine/HitResult.h"
@@ -23,6 +23,17 @@ public:
 
 	struct FRoomResult
 	{
+		// Measured from the echogram. T30 is the better estimate but can legitimately be
+		// unavailable when the window is too short for the room, so consumers must fall back.
+		// Listener -> nearest surface -> listener, so a room-scale figure rather than a true
+		// per-source predelay, which would need the source position the probe does not have.
+		float FirstReflectionSeconds = 0.f;
+
+		float MeasuredT30[RTA::NumBands] = {};
+		float MeasuredT20[RTA::NumBands] = {};
+		bool  bT30Valid[RTA::NumBands] = {};
+		bool  bT20Valid[RTA::NumBands] = {};
+
 		float EyringRT60[RTA::NumBands] = {};
 		float MeanAbsorption[RTA::NumBands] = {};
 		float MeanFreePathMetres = 0.f;
@@ -95,7 +106,7 @@ public:
 		float Absorption[RTA::NumBands] = {};
 		float Scattering = RTA::DefaultScattering;
 	};
-
+	
 	FRaytraceManager();
 	~FRaytraceManager();
 
@@ -115,7 +126,7 @@ public:
 
 	void SetWorld(UWorld* WorldIn) { this->World = WorldIn; }
 
-	void DumpEchogramCsv() const;
+	void DumpEchogram() const;
 
 private:
 	bool TickAudioTrace(float DeltaTime);
@@ -154,17 +165,15 @@ private:
 	static constexpr int32 ProbeMaxDepth = 64;
 	static constexpr int32 RouletteStartDepth = 10;
 	static constexpr float RouletteQMin = 0.05f;
-	static constexpr float RouletteQMax = 0.95f;
+	static constexpr float RouletteQMax = 0.99f;
 	static constexpr float EnergyFloor = 1.0e-6f;
 
 	static constexpr float SurfaceBiasCm = 1.f;
-	static constexpr float RayLengthHeadroom = 2.0f;
-	static constexpr float RayLengthSmoothing = 0.2f;
-	static constexpr float MinAdaptiveRayLength = 1000.f;    //  10 m
-	static constexpr float MaxAdaptiveRayLength = 20000.f;   // 200 m
 	static constexpr float OcclusionSmoothingAlpha = 0.15f;
-
-	std::atomic<float> AdaptiveMaxRayLength{ 3000.f };
+	
+	static constexpr float OcclusionRayLengthHeadroom = 2.0f;
+	static constexpr float MinOcclusionRayLengthCm = 1000.f;    //  10 m
+	static constexpr float MaxOcclusionRayLengthCm = 20000.f;   // 200 m
 
 	std::atomic<bool> bAudioTraceRunning{ false };
 	std::atomic<bool> bRoomProbeRunning{ false };

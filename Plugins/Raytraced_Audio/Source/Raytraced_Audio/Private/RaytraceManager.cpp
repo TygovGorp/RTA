@@ -8,6 +8,9 @@
 #include "Misc/Paths.h"
 #include "Engine/World.h"
 #include "Tasks/Task.h"
+#include "EchogramXlsx.h"
+#include "RTADecayMetrics.h"
+#include "Misc/DateTime.h"
 
 
 FRaytraceManager::FRaytraceManager() : World(nullptr)
@@ -375,7 +378,15 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 	TRACE_CPUPROFILER_EVENT_SCOPE(RTA_BounceRays);
 
 	const int32 NumSources = ValidData.Num();
-	const float RayLength = AdaptiveMaxRayLength.load(std::memory_order_relaxed);
+
+	// Reach far enough to find a surface that sees the furthest source, and no further.
+	float FurthestSourceCm = 0.f;
+	for (const FValidData& Entry : ValidData)
+	{
+		FurthestSourceCm = FMath::Max(FurthestSourceCm, float(FVector::Dist(ListenerPos, Entry.EmitterPos)));
+	}
+	const float RayLength = FMath::Clamp(FurthestSourceCm * OcclusionRayLengthHeadroom,
+	                                     MinOcclusionRayLengthCm, MaxOcclusionRayLengthCm);
 
 	FCollisionQueryParams CollisionQueryParams;
 	CollisionQueryParams.bReturnPhysicalMaterial = true;
@@ -581,13 +592,11 @@ void FRaytraceManager::RunRoomProbe(uint32 TraceSeed)
 	CollisionQueryParams.bReturnPhysicalMaterial = true;
 	CollisionQueryParams.bTraceComplex = true;
 
-	const float RayLength = AdaptiveMaxRayLength.load(std::memory_order_relaxed);
-
 	double PathLengthSumCm = 0.0;
 	double AbsorptionSum[RTA::NumBands] = {};
 	int32  HitCount = 0;
 	int32  EscapedRays = 0;
-	float  MaxHitDistanceCm = 0.f;
+	float  MaxHitDistanceCm = 0.f;   // diagnostic only; feeds nothing
 
 	FRandomStream RndStrm;
 
@@ -606,16 +615,27 @@ void FRaytraceManager::RunRoomProbe(uint32 TraceSeed)
 
 		for (int32 Depth = 0; Depth < ProbeMaxDepth; ++Depth)
 		{
+			const float RemainingPathCm = FEchogram::MaxPathCm - PathLengthCm;
+			if (RemainingPathCm <= 0.f)
+			{
+				break;
+			}
+
 			const FVector RandomDir = SampleBounceDirection(
 				bHasHitSurface, SegmentStart, PreviousSegmentStart, LastHitNormal, LastHitScattering, RndStrm);
 
-			const FVector TraceEnd = SegmentStart + RandomDir * RayLength;
+			const FVector TraceEnd = SegmentStart + RandomDir * RemainingPathCm;
 
 			FHitResult HitResult;
 			World->LineTraceSingleByChannel(HitResult, SegmentStart, TraceEnd, ECC_Visibility, CollisionQueryParams);
 			if (!HitResult.IsValidBlockingHit())
 			{
 				++EscapedRays;
+				for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+				{
+					AbsorptionSum[Band] += 1.0;
+				}
+				++HitCount;
 				break;
 			}
 
@@ -632,7 +652,7 @@ void FRaytraceManager::RunRoomProbe(uint32 TraceSeed)
 
 			{
 				const FVector HitPoint = HitResult.Location;
-				const FVector ToListener = ListenerPos - HitPoint;   // toward, not away
+				const FVector ToListener = ListenerPos - HitPoint;
 
 				const float ShadowDistanceCm = FMath::Max(ToListener.Size(), RTA::MinReceiverDistanceCm);
 				const FVector DirectionToListener = ToListener / ShadowDistanceCm;
@@ -666,7 +686,7 @@ void FRaytraceManager::RunRoomProbe(uint32 TraceSeed)
 								const float AirAtten = FMath::Exp(
 									-RTA::AirAbsorptionPerMetre[Band] * TotalPathMetres);
 
-								Fresh[Fresh.Index(Band, Bin)] +=
+								Fresh.At(Band, Bin) +=
 									RayEnergy[Band] * Surface.Reflected[Band] * GeometryTerm * AirAtten;
 							}
 						}
@@ -713,23 +733,20 @@ void FRaytraceManager::RunRoomProbe(uint32 TraceSeed)
 		(float(RayCount) * PI * FMath::Square(RTA::ReceiverRadiusCm));
 	Fresh.Scale(NormFactor);
 
-	if (MaxHitDistanceCm > 0.f)
-	{
-		const float Target = FMath::Clamp(MaxHitDistanceCm * RayLengthHeadroom,
-		                                  MinAdaptiveRayLength, MaxAdaptiveRayLength);
-		const float Current = AdaptiveMaxRayLength.load(std::memory_order_relaxed);
-		AdaptiveMaxRayLength.store(FMath::Lerp(Current, Target, RayLengthSmoothing),
-		                           std::memory_order_relaxed);
-	}
-
 	FRoomResult Published;
 
 	{
 		FWriteScopeLock Lock(Listener->Lock);
 
 		++Listener->ProbeCount;
-		const float Alpha = FMath::Max(Listener->AccumulatedEchogram.GetSmoothingAlpha(), 1.f / float(Listener->ProbeCount));
-		Listener->AccumulatedEchogram.Accumulate(Fresh, Alpha);
+		Listener->AccumulatedEchogram.Accumulate(Fresh, Listener->AccumulatedEchogram.GetSmoothingAlpha());
+		
+		TStaticArray<FDecayMetric, RTA::NumBands> DecayMetrics;
+		for (int Band = 0; Band < RTA::NumBands; ++Band)
+		{
+			DecayMetrics[Band] = RTA::ComputeDecayMetrics(Listener->AccumulatedEchogram, Band);
+		}
+
 
 		if (HitCount > 0)
 		{
@@ -750,7 +767,20 @@ void FRaytraceManager::RunRoomProbe(uint32 TraceSeed)
 		{
 			Published.EyringRT60[Band] = Listener->EyringRT60[Band];
 			Published.MeanAbsorption[Band] = Listener->MeanAbsorption[Band];
+			Published.MeasuredT30[Band] = DecayMetrics[Band].T30;
+			Published.MeasuredT20[Band] = DecayMetrics[Band].T20;
+			Published.bT30Valid[Band]   = DecayMetrics[Band].bT30Valid;
+			Published.bT20Valid[Band]   = DecayMetrics[Band].bT20Valid;
 		}
+		{
+			// 1 kHz: the densest band, so the least likely to report a spuriously late first
+			// arrival from a bin that simply has not been filled yet.
+			const int32 FirstBin = Listener->AccumulatedEchogram.FirstNonZeroBin(3);
+			Published.FirstReflectionSeconds = (FirstBin > 0)
+				? float(FirstBin) * FEchogram::BinWidthSeconds
+				: 0.f;
+		}
+
 		Published.MeanFreePathMetres = Listener->MeanFreePathMetres;
 		Published.EscapedRayFraction = Listener->EscapedRayFraction;
 		Published.MeanBounceDepth = Listener->MeanBounceDepth;
@@ -762,11 +792,13 @@ void FRaytraceManager::RunRoomProbe(uint32 TraceSeed)
 	{
 		FReadScopeLock Lock(Listener->Lock);
 		UE_LOG(LogRTA, Log,
-			TEXT("RoomProbe: MFP=%.2fm Hits=%d MeanDepth=%.1f Escaped=%.0f%% RayLen=%.0fcm "
+			TEXT("RoomProbe: MFP=%.2fm Hits=%d MeanDepth=%.1f, MeanAbsorption=[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f], Escaped=%.0f%% MaxHit=%.0fcm "
 			     "Eyring=[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f] BandTotal[1k]=%.3e LastBin[1k]=%d"),
-			Published.MeanFreePathMetres, HitCount, Published.MeanBounceDepth,
+			Published.MeanFreePathMetres, HitCount, Published.MeanBounceDepth, 
+			Published.MeanAbsorption[0], Published.MeanAbsorption[1], Published.MeanAbsorption[2],
+			Published.MeanAbsorption[3], Published.MeanAbsorption[4], Published.MeanAbsorption[5],
 			Published.EscapedRayFraction * 100.f,
-			AdaptiveMaxRayLength.load(std::memory_order_relaxed),
+			MaxHitDistanceCm,
 			Published.EyringRT60[0], Published.EyringRT60[1], Published.EyringRT60[2],
 			Published.EyringRT60[3], Published.EyringRT60[4], Published.EyringRT60[5],
 			Listener->AccumulatedEchogram.BandTotal(3),
@@ -800,38 +832,35 @@ void FRaytraceManager::ComputeEyringRT60(float MeanFreePathMetres,
 	}
 }
 
-void FRaytraceManager::DumpEchogramCsv() const
+
+void FRaytraceManager::DumpEchogram() const
 {
 	if (!Listener.IsValid()) return;
-
-	FString Csv = TEXT("BinIndex,TimeMs");
-	for (int32 Band = 0; Band < RTA::NumBands; ++Band)
-	{
-		Csv += FString::Printf(TEXT(",%.0fHz"), RTA::FrequencyBands[Band]);
-	}
-	Csv += LINE_TERMINATOR;
-
+	FEchogram Snapshot;
+	int64 ProbeCount = 0;
 	{
 		FReadScopeLock Lock(Listener->Lock);
-		for (int32 Bin = 0; Bin < Listener->AccumulatedEchogram.GetNumBins(); ++Bin)
-		{
-			Csv += FString::Printf(TEXT("%d,%.1f"), Bin, Bin * Listener->AccumulatedEchogram.GetBinWidthSeconds() * 1000.f);
-			for (int32 Band = 0; Band < RTA::NumBands; ++Band)
-			{
-				Csv += FString::Printf(TEXT(",%.9e"),
-					Listener->AccumulatedEchogram[Listener->AccumulatedEchogram.Index(Band, Bin)]);
-			}
-			Csv += LINE_TERMINATOR;
-		}
+		Snapshot = Listener->AccumulatedEchogram;
+		ProbeCount = Listener->ProbeCount;
 	}
+	
+	const FDateTime Now = FDateTime::Now();
+	const FString Path = FPaths::ProjectSavedDir()
+		/ FString::Printf(TEXT("RTA_Echogram_%s.xlsx"), *Now.ToString(TEXT("%Y%m%d_%H%M%S")));
+	const FString Note = FString::Printf(TEXT("Dumped %s, %lld probes accumulated."),
+		*Now.ToString(TEXT("%Y-%m-%d %H:%M:%S")), ProbeCount);
 
-	const FString Path = FPaths::ProjectSavedDir() / TEXT("RTA_Echogram.csv");
-	if (FFileHelper::SaveStringToFile(Csv, *Path))
+	int32 NonFinite = 0;
+	if (RTA::WriteEchogramXlsx(Path, Snapshot, Note, NonFinite))
 	{
-		UE_LOG(LogRTA, Log, TEXT("Echogram written to %s"), *Path);
+		UE_LOG(LogRTA, Log, TEXT("Echogram written to %s"), *FPaths::ConvertRelativePathToFull(Path));
 	}
 	else
 	{
 		UE_LOG(LogRTA, Warning, TEXT("Failed to write echogram to %s"), *Path);
+	}
+	if (NonFinite > 0)
+	{
+		UE_LOG(LogRTA, Warning, TEXT("Echogram contained %d non-finite values (written as 0)."), NonFinite);
 	}
 }

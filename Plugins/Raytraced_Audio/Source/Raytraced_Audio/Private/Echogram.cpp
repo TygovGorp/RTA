@@ -1,13 +1,6 @@
-#include "RTAEchogram.h"
+#include "Echogram.h"
 
-int32 FEchogram::Index(int32 Band, int32 Bin) const
-{
-	checkSlow(Band >= 0 && Band < RTA::NumBands);
-	checkSlow(Bin >= 0 && Bin < NumBins);
-	return Band * NumBins + Bin;
-}
-
-int32 FEchogram::BinFromPathLengthCm(float PathLengthCm) const
+int32 FEchogram::BinFromPathLengthCm(float PathLengthCm)
 {
 	const float TimeSeconds = PathLengthCm / RTA::SpeedOfSoundCmPerSecond;
 	const int32 Bin = FMath::FloorToInt32(TimeSeconds / BinWidthSeconds);
@@ -29,7 +22,7 @@ void FEchogram::Scale(float Factor)
 	}
 }
 
-void FEchogram::Accumulate(FEchogram& Fresh, float Alpha)
+void FEchogram::Accumulate(const FEchogram& Fresh, float Alpha)
 {
 	for (int32 i = 0; i < Size; ++i)
 	{
@@ -37,12 +30,13 @@ void FEchogram::Accumulate(FEchogram& Fresh, float Alpha)
 	}
 }
 
-int32 FEchogram::LastNonZeroBin(int32 Band)
+int32 FEchogram::FirstNonZeroBin(int32 Band) const
 {
-	const int32 Base = Band * NumBins;
-	for (int32 Bin = NumBins - 1; Bin >= 0; --Bin)
+	// Bin 0 is reserved for the direct path and never deposited into, so the first populated
+	// bin is the earliest reflection the probe found.
+	for (int32 Bin = 1; Bin < NumBins; ++Bin)
 	{
-		if (Echogram[Base + Bin] > 0.f)
+		if (At(Band, Bin) > 0.f)
 		{
 			return Bin;
 		}
@@ -50,13 +44,24 @@ int32 FEchogram::LastNonZeroBin(int32 Band)
 	return INDEX_NONE;
 }
 
-double FEchogram::BandTotal(int32 Band)
+int32 FEchogram::LastNonZeroBin(int32 Band) const
 {
-	const int32 Base = Band * NumBins;
+	for (int32 Bin = NumBins - 1; Bin >= 0; --Bin)
+	{
+		if (At(Band, Bin) > 0.f)
+		{
+			return Bin;
+		}
+	}
+	return INDEX_NONE;
+}
+
+double FEchogram::BandTotal(int32 Band) const
+{
 	double Total = 0.0;
 	for (int32 Bin = 0; Bin < NumBins; ++Bin)
 	{
-		Total += Echogram[Base + Bin];
+		Total += At(Band, Bin);
 	}
 	return Total;
 }

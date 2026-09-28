@@ -2,6 +2,7 @@
 
 #include "AssetTypeCategories.h"
 #include "RTAOcclusionSourceSettings.h"
+#include "RTAReverbSourceSettings.h"
 
 URTAOcclusionSourceSettingsFactory::URTAOcclusionSourceSettingsFactory()
 {
@@ -18,6 +19,25 @@ UObject* URTAOcclusionSourceSettingsFactory::FactoryCreateNew(
 }
 
 uint32 URTAOcclusionSourceSettingsFactory::GetMenuCategories() const
+{
+	return EAssetTypeCategories::Sounds;
+}
+
+URTAReverbSourceSettingsFactory::URTAReverbSourceSettingsFactory()
+{
+	SupportedClass = URTAReverbSourceSettings::StaticClass();
+	bCreateNew = true;
+	bEditAfterNew = true;
+}
+
+UObject* URTAReverbSourceSettingsFactory::FactoryCreateNew(
+	UClass* InClass, UObject* InParent, FName InName, EObjectFlags Flags,
+	UObject* /*Context*/, FFeedbackContext* /*Warn*/)
+{
+	return NewObject<URTAReverbSourceSettings>(InParent, InName, Flags);
+}
+
+uint32 URTAReverbSourceSettingsFactory::GetMenuCategories() const
 {
 	return EAssetTypeCategories::Sounds;
 }

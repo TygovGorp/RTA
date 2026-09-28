@@ -1,16 +1,19 @@
-﻿#pragma once
+#pragma once
 #include "IAudioExtensionPlugin.h"
 #include "RaytraceManager.h"
+#include "RTAReverbSubmix.h"
+
+class USoundSubmix;
 
 class FRaytracedReverb : public IAudioReverb
 {
 public:
 	FRaytracedReverb(const TSharedPtr<FRaytraceManager>& Manager): RTManager(Manager)
 	{}
-	
+
 	/** Initialize the reverb plugin with the same rate and number of sources. */
 	virtual void Initialize(const FAudioPluginInitializationParams InitializationParams) override;
-	
+
 	/**
 	* Shuts down the audio plugin.
 	*/
@@ -35,7 +38,31 @@ public:
 
 	/** Processes audio with the given input and output data structs.*/
 	virtual void ProcessSourceAudio(const FAudioPluginSourceInputData& InputData, FAudioPluginSourceOutputData& OutputData) override;
-	
+
 private:
+	struct FReverbSourceState
+	{
+		bool   bEnableReverb = true;
+		float  SendGain = 1.f;
+		uint32 NumChannels = 0;
+
+		// Previous buffer's send, so the gain can ramp instead of stepping.
+		float  PrevSend = -1.f;
+	};
+
+	/** Reads the room probe and pushes decay into the submix effect. Audio render thread. */
+	void UpdateRoomDecay();
+
 	TSharedPtr<FRaytraceManager> RTManager;
+	
+	TObjectPtr<USoundSubmix> ReverbSubmix = nullptr;
+	TObjectPtr<URTAReverbSubmixPreset> ReverbPreset = nullptr;
+
+	FSoundEffectSubmixPtr SubmixEffect = nullptr;
+
+	// Audio thread only: OnInitSource, OnReleaseSource and ProcessSourceAudio all run there.
+	TMap<uint32, FReverbSourceState> SourceStates;
+
+	float SampleRate = 48000.f;
+	double LastRT60LogSeconds = 0.0;
 };

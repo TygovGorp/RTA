@@ -23,4 +23,5 @@ private:
 	FRaytracedReverbFactory ReverbFactory;
 
 	TUniquePtr<FAutoConsoleCommand> DumpEchogramCommand;
+	TUniquePtr<FAutoConsoleCommand> TestFDNCommand;
 };

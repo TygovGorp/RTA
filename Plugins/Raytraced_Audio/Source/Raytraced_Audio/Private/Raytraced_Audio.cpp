@@ -1,5 +1,6 @@
 #include "Raytraced_Audio.h"
 #include "Log.h"
+#include "RTADecayMetrics.h"
 #include "HAL/IConsoleManager.h"
 
 DEFINE_LOG_CATEGORY(LogRTA);
@@ -26,7 +27,7 @@ void FRaytracedAudioModule::StartupModule()
 
 	DumpEchogramCommand = MakeUnique<FAutoConsoleCommand>(
 		TEXT("rta.DumpEchogram"),
-		TEXT("Writes the accumulated echogram to Saved/RTA_Echogram.csv"),
+		TEXT("Writes the accumulated echogram to Saved/RTA_Echogram_<timestamp>.xlsx"),
 		FConsoleCommandDelegate::CreateLambda([this]()
 		{
 			if (RTManagerMap.Num() == 0)
@@ -38,15 +39,50 @@ void FRaytracedAudioModule::StartupModule()
 			{
 				if (Entry.Value.IsValid())
 				{
-					Entry.Value->DumpEchogramCsv();
+					Entry.Value->DumpEchogram();
 				}
 			}
 		}));
+	TestFDNCommand = MakeUnique<FAutoConsoleCommand>(
+	TEXT("rta.TestFDN"),
+	   TEXT("Measures the FDN's own decay against a requested RT60. Usage: rta.TestFDN [seconds]"),
+	   FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& Args)
+	{
+		const float RT60 = Args.Num() > 0 ? FCString::Atof(*Args[0]) : 2.0f;
+		
+		auto FDN = FFeedbackDelayNetwork();
+		FDN.Init(48000.f);
+		FDN.SetRT60(RT60);
+		FDN.SetDamping(0);
+		FDN.Reset();
+		
+		auto NumSamples = ceil(RT60 * 2.f * 48000.f);
+		
+		TArray<float> Capture;
+		Capture.SetNumUninitialized(NumSamples);
+		Capture[0] = FDN.ProcessSample(1.0f);
+
+		for (int n = 1; n < NumSamples; ++n)
+			Capture[n] = FDN.ProcessSample(0.0f);
+		
+		auto Echo = FEchogram();
+		
+		for (int n = 0; n < NumSamples; ++n)
+		{
+			auto Bin = floor((n / 48000.f) / FEchogram::BinWidthSeconds);
+			if (Bin < FEchogram::NumBins)
+				Echo.At(0, Bin) += Capture[n] * Capture[n];
+		}
+		
+		auto M = RTA::ComputeDecayMetrics(Echo, 0);
+		UE_LOG(LogRTA, Log, TEXT("asked %.2f  measured T30 %.2f  |R| %.3f  curvature %.1f%%  window ok %d"), RT60, M.T30, abs(M.T30_R), M.CurvaturePercent, M.bWindowSufficient);
+	}));
 }
 
 void FRaytracedAudioModule::ShutdownModule()
 {
 	DumpEchogramCommand.Reset();
+	TestFDNCommand.Reset();
 }
 
 #undef LOCTEXT_NAMESPACE
