@@ -24,11 +24,14 @@ void FRTAReverbSubmix::OnPresetChanged()
 	}
 }
 
-void FRTAReverbSubmix::SetRoomDecay(const float RT60PerBand[6], float PredelaySeconds)
+void FRTAReverbSubmix::SetRoomDecay(const float RT60PerBand[6], float PredelaySeconds,
+                                    float DampingScale, float DampingOverride)
 {
-	FDN.SetPredelaySeconds(PredelaySeconds);
-
-	bool bRoomDelayAppliedChanged = !bRoomDecayApplied;
+	//FDN.SetPredelaySeconds(PredelaySeconds);
+	
+	bool bRoomDelayAppliedChanged = !bRoomDecayApplied
+		|| !FMath::IsNearlyEqual(DampingScale, LastDampingScale)
+		|| !FMath::IsNearlyEqual(DampingOverride, LastDampingOverride);
 	for (int32 Band = 0; Band < 6 && !bRoomDelayAppliedChanged; ++Band)
 	{
 		bRoomDelayAppliedChanged = FMath::Abs(RT60PerBand[Band] - LastAppliedRT60[Band])
@@ -41,7 +44,19 @@ void FRTAReverbSubmix::SetRoomDecay(const float RT60PerBand[6], float PredelaySe
 	}
 
 	FDN.SetDecayFromBands(RT60PerBand);
+	
+	if (DampingOverride >= 0.f)
+	{
+		FDN.SetDamping(DampingOverride);
+	}
+	else if (!FMath::IsNearlyEqual(DampingScale, 1.f))
+	{
+		FDN.SetDamping(FDN.GetDamping() * DampingScale);
+	}
+
 	FMemory::Memcpy(LastAppliedRT60, RT60PerBand, sizeof(LastAppliedRT60));
+	LastDampingScale = DampingScale;
+	LastDampingOverride = DampingOverride;
 	bRoomDecayApplied = true;
 }
 

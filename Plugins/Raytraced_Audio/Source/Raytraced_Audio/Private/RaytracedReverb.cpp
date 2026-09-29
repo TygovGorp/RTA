@@ -12,7 +12,7 @@ namespace
 		TEXT("Reverb decay source: 0 = Eyring, 1 = measured T30 (falls back to T20, then Eyring)."),
 		ECVF_Default);
 	
-	static float GRTAMaxRT60 = 8.f;
+	static float GRTAMaxRT60 = 4.f;
 	static FAutoConsoleVariableRef CVarRTAMaxRT60(
 		TEXT("rta.MaxRT60"),
 		GRTAMaxRT60,
@@ -24,6 +24,17 @@ namespace
 		TEXT("rta.LogRT60"),
 		GRTALogRT60,
 		TEXT("Log the decay actually driving the reverb, once per second."),
+		ECVF_Default);
+	static float GRTADampingScale = 1.f;
+	static FAutoConsoleVariableRef CVarRTADampingScale(
+		TEXT("rta.Reverb.DampingScale"), GRTADampingScale,
+		TEXT("Multiplier on the damping derived from the measured high/low decay ratio."),
+		ECVF_Default);
+
+	static float GRTADampingOverride = -1.f;
+	static FAutoConsoleVariableRef CVarRTADampingOverride(
+		TEXT("rta.Reverb.DampingOverride"), GRTADampingOverride,
+		TEXT("0..0.95 forces a damping value. Negative uses the measured one."),
 		ECVF_Default);
 }
 #include "RTAReverbSourceSettings.h"
@@ -163,7 +174,7 @@ void FRaytracedReverb::UpdateRoomDecay()
 		RT60[Band] = FMath::Clamp(Value, 0.05f, GRTAMaxRT60);
 	}
 
-	static_cast<FRTAReverbSubmix*>(SubmixEffect.Get())->SetRoomDecay(RT60, Room.FirstReflectionSeconds);
+	static_cast<FRTAReverbSubmix*>(SubmixEffect.Get())->SetRoomDecay(RT60, Room.FirstReflectionSeconds, GRTADampingScale, GRTADampingOverride);
 
 	if (GRTALogRT60 != 0)
 	{

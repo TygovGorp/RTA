@@ -76,6 +76,15 @@ void FRaytracedAudioModule::StartupModule()
 		
 		auto M = RTA::ComputeDecayMetrics(Echo, 0);
 		UE_LOG(LogRTA, Log, TEXT("asked %.2f  measured T30 %.2f  |R| %.3f  curvature %.1f%%  window ok %d"), RT60, M.T30, abs(M.T30_R), M.CurvaturePercent, M.bWindowSufficient);
+	   	
+	   	FString Csv = TEXT("Sample,Time,Amplitude\n");
+		for (int32 n = 0; n < NumSamples; ++n)
+		{
+			Csv += FString::Printf(TEXT("%d,%.6f,%.8f\n"), n, n / 48000.f, Capture[n]);
+		}
+		const FString Path = FPaths::ProjectSavedDir() / TEXT("RTA_FDN_IR.csv");
+		FFileHelper::SaveStringToFile(Csv, *Path);
+		UE_LOG(LogRTA, Log, TEXT("FDN IR written to %s"), *Path);
 	}));
 }
 

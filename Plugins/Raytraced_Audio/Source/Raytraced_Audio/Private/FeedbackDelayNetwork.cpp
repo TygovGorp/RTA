@@ -14,8 +14,14 @@ void FFeedbackDelayNetwork::Init(float InSampleRate)
 		const int32 Wanted = FMath::RoundToInt(BasePrimes[i] * SampleRate / 48000.f);
 		const int32 Len = NearestPrimeAtLeast(Wanted);
 
-		Lines[i].Init(Len);
+		const int32 Headroom = FMath::CeilToInt(Len * MaxModDepthFraction) + 4;
+		Lines[i].Init(Len + Headroom);
+
+		BaseDelaySamples[i] = float(Len);
 		DelaySeconds[i] = float(Len) / SampleRate;
+
+		ModRate[i] = 0.31f + 0.05f * float(i) + 0.013f * float(i * i % 7);
+		ModPhase[i] = 2.f * PI * float(i) / float(NumLines);
 	}
 
 	Predelay.Init(FMath::CeilToInt(MaxPredelaySeconds * SampleRate));
@@ -91,9 +97,11 @@ void FFeedbackDelayNetwork::Reset()
 		FilterZ1[i] = 0.f;
 		Feed[i] = 0.f;
 		Gain[i] = TargetGain[i];
+		
 	}
 	Predelay.Reset();
 	Damping = TargetDamping;
+	ModTime = 0.f;
 }
 
 float FFeedbackDelayNetwork::ProcessSample(float In)
@@ -104,10 +112,17 @@ float FFeedbackDelayNetwork::ProcessSample(float In)
 	const float Delayed = Predelay.Buffer[ReadIndex];
 	if (++Predelay.WriteIndex >= BufLen) Predelay.WriteIndex = 0;
 
+	ModTime += 1.f / SampleRate;
+	if (ModTime > 1000.f) ModTime -= 1000.f;   // keep sin() argument in a precise range
+	
 	TStaticArray<float, NumLines> Tap;
 	for (int32 i = 0; i < NumLines; ++i)
 	{
-		Tap[i] = Lines[i].Process(Feed[i]);
+		const float Depth = BaseDelaySamples[i] * ModDepthFraction;
+		const float D = BaseDelaySamples[i]
+			+ Depth * FMath::Sin(2.f * PI * ModRate[i] * ModTime + ModPhase[i]);
+
+		Tap[i] = Lines[i].ReadFractional(D);
 	}
 
 	float Sum = 0.f;
@@ -125,7 +140,7 @@ float FFeedbackDelayNetwork::ProcessSample(float In)
 
 	for (int32 i = 0; i < NumLines; ++i)
 	{
-		Feed[i] = Delayed + Tap[i];
+		Lines[i].Write(Delayed + Tap[i]);
 	}
 
 	return Out;

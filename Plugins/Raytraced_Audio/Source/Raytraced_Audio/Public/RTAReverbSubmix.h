@@ -15,7 +15,7 @@ struct RAYTRACED_AUDIO_API FRTAReverbSubmixSettings
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RTA Reverb", meta = (ClampMin = "0.0"))
 	float RT60Seconds = 2.f;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RTA Reverb", meta = (ClampMin = "0.0", ClampMax = "0.95"))
-	float Damping = 0.f;
+	float Damping = 0.2f;
 };
 
 class RAYTRACED_AUDIO_API FRTAReverbSubmix : public FSoundEffectSubmix
@@ -26,7 +26,8 @@ public:
 	virtual void OnProcessAudio(const FSoundEffectSubmixInputData& InputData,
 								FSoundEffectSubmixOutputData& OutputData) override;
 	
-	void SetRoomDecay(const float RT60PerBand[6], float PredelaySeconds);
+	void SetRoomDecay(const float RT60PerBand[6], float PredelaySeconds,
+					  float DampingScale, float DampingOverride);
 
 private:
 	virtual void Init(const FSoundEffectSubmixInitData& InitData) override;
@@ -34,6 +35,8 @@ private:
 	FFeedbackDelayNetwork FDN;
 	float OutputGain = 1.f;
 	float LastAppliedRT60[6] = {};
+	float LastDampingScale = 1.f;
+	float LastDampingOverride = -1.f;
 	bool  bRoomDecayApplied = false;
 	Audio::AlignedFloatBuffer MonoIn;
 	Audio::AlignedFloatBuffer MonoOut;
