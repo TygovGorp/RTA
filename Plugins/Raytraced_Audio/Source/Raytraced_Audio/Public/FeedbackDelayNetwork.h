@@ -65,7 +65,7 @@ private:
 	static void FastHadamard(TStaticArray<float, NumLines>& V);
 
 	TStaticArray<FRTADelayLine, NumLines> Lines;
-	TStaticArray<float, NumLines> Gain, TargetGain, DelaySeconds, FilterZ1, Feed, BaseDelaySamples, ModRate, ModPhase;
+	TStaticArray<float, NumLines> Gain, TargetGain, DelaySeconds, FilterZ1, BaseDelaySamples, ModRate, ModPhase;
 	float ModTime = 0.f, MaxModDepthFraction = 0.02f, ModDepthFraction = 0.012f;
 	
 	FRTADelayLine Predelay;

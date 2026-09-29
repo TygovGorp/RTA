@@ -95,7 +95,6 @@ void FFeedbackDelayNetwork::Reset()
 	{
 		Lines[i].Reset();
 		FilterZ1[i] = 0.f;
-		Feed[i] = 0.f;
 		Gain[i] = TargetGain[i];
 		
 	}
