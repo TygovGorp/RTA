@@ -39,7 +39,7 @@ private:
 	float LastDampingOverride = -1.f;
 	bool  bRoomDecayApplied = false;
 	Audio::AlignedFloatBuffer MonoIn;
-	Audio::AlignedFloatBuffer MonoOut;
+	TStaticArray<Audio::AlignedFloatBuffer, 2> StereoOut;
 };
 
 UCLASS()

@@ -59,11 +59,11 @@ void FRaytracedAudioModule::StartupModule()
 		auto NumSamples = ceil(RT60 * 2.f * 48000.f);
 		
 		TArray<float> Capture;
-		Capture.SetNumUninitialized(NumSamples);
+		/*Capture.SetNumUninitialized(NumSamples);
 		Capture[0] = FDN.ProcessSample(1.0f);
 
 		for (int n = 1; n < NumSamples; ++n)
-			Capture[n] = FDN.ProcessSample(0.0f);
+			Capture[n] = FDN.ProcessSample(0.0f);*/
 		
 		auto Echo = FEchogram();
 		

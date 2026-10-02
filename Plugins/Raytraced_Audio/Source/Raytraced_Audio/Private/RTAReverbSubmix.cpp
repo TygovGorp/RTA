@@ -7,7 +7,8 @@ void FRTAReverbSubmix::Init(const FSoundEffectSubmixInitData& InitData)
 {
 	FDN.Init(InitData.SampleRate);
 	MonoIn.SetNumUninitialized(RTA::MaxFramesPerBlock);
-	MonoOut.SetNumUninitialized(RTA::MaxFramesPerBlock);
+	StereoOut[0].SetNumUninitialized(RTA::MaxFramesPerBlock);
+	StereoOut[1].SetNumUninitialized(RTA::MaxFramesPerBlock);
 
 	UE_LOG(LogRTA, Log, TEXT("RTAReverbSubmix: init at %.0f Hz"), InitData.SampleRate);
 }
@@ -91,12 +92,13 @@ void FRTAReverbSubmix::OnProcessAudio(const FSoundEffectSubmixInputData& InputDa
 		MonoIn[i] = Acc / static_cast<float>(C);
 	}
 
-	FDN.ProcessBlock(MonoIn.GetData(), MonoOut.GetData(), N);
+	FDN.ProcessBlock(MonoIn.GetData(), {StereoOut[0].GetData(), StereoOut[1].GetData()}, N);
 
-	for (int i = 0; i < N; ++i)
+	for (int32 i = 0; i < N; ++i)
 	{
-		auto Wet = MonoOut[i] * OutputGain;
-		for (int Ch = 0; Ch < C; ++Ch)
-			Out[i*C +Ch] = Wet;
+		for (int32 Ch = 0; Ch < C; ++Ch)
+		{
+			Out[i*C + Ch] = StereoOut[Ch & 1][i] * OutputGain;
+		}
 	}
 }

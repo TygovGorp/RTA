@@ -103,7 +103,7 @@ void FFeedbackDelayNetwork::Reset()
 	ModTime = 0.f;
 }
 
-float FFeedbackDelayNetwork::ProcessSample(float In)
+TStaticArray<float, 2> FFeedbackDelayNetwork::ProcessSample(float In)
 {
 	const int32 BufLen = Predelay.Buffer.Num();
 	Predelay.Buffer[Predelay.WriteIndex] = In;
@@ -123,10 +123,16 @@ float FFeedbackDelayNetwork::ProcessSample(float In)
 
 		Tap[i] = Lines[i].ReadFractional(D);
 	}
-
-	float Sum = 0.f;
-	for (int32 i = 0; i < NumLines; ++i) Sum += Tap[i];
-	const float Out = Sum / FMath::Sqrt(float(NumLines));
+	
+	TStaticArray<float, 2> Sum = 0.f;
+	for (int32 i = 0; i < NumLines; ++i)
+	{
+		Sum[(i < 8) ? 0 : 1] += Tap[i];
+	}
+	TStaticArray<float, 2> Out;
+	const float Norm = 1.f / FMath::Sqrt(float(NumLines / 2));
+	Out[0] = Sum[0] * Norm;
+	Out[1] = Sum[1] * Norm;
 
 	for (int32 i = 0; i < NumLines; ++i)
 	{
@@ -145,9 +151,9 @@ float FFeedbackDelayNetwork::ProcessSample(float In)
 	return Out;
 }
 
-void FFeedbackDelayNetwork::ProcessBlock(const float* In, float* Out, int32 NumFrames)
+void FFeedbackDelayNetwork::ProcessBlock(const float* In, TStaticArray<float*, 2> Out, int32 NumFrames)
 {
-	if (!In || !Out || NumFrames <= 0) return;
+	if (!In || !Out[0] || !Out[1] || NumFrames <= 0) return;
 
 	const float InvFrames = 1.f / float(NumFrames);
 
@@ -163,7 +169,9 @@ void FFeedbackDelayNetwork::ProcessBlock(const float* In, float* Out, int32 NumF
 		for (int32 i = 0; i < NumLines; ++i) Gain[i] += GainStep[i];
 		Damping += DampingStep;
 
-		Out[n] = ProcessSample(In[n]);
+		auto Temp = ProcessSample(In[n]);
+		Out[0][n] = Temp[0];
+		Out[1][n] = Temp[1];
 	}
 
 	for (int32 i = 0; i < NumLines; ++i) Gain[i] = TargetGain[i];

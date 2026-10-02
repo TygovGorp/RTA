@@ -52,8 +52,8 @@ public:
 
 	float GetMeanDelaySeconds() const;
 	void Reset();
-	float ProcessSample(float In);
-	void ProcessBlock(const float* In, float* Out, int32 NumFrames);
+	TStaticArray<float, 2> ProcessSample(float In);
+	void ProcessBlock(const float* In, TStaticArray<float*, 2> Out, int32 NumFrames);
 
 private:
 	static int32 NearestPrimeAtLeast(int32 Wanted);
