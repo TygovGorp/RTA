@@ -11,6 +11,17 @@
 #include "EchogramXlsx.h"
 #include "RTADecayMetrics.h"
 #include "Misc/DateTime.h"
+#include "Async/ParallelFor.h"
+#include "BatchedTracer.h"
+
+namespace
+{
+	static int32 GRTAValidateBatchedTrace = 0;
+	static FAutoConsoleVariableRef CVarRTAValidateBatchedTrace(
+		TEXT("rta.ValidateBatchedTrace"), GRTAValidateBatchedTrace,
+		TEXT("Compare the batched tracer against UWorld::LineTraceTestByChannel on a sample."),
+		ECVF_Default);
+}
 
 
 FRaytraceManager::FRaytraceManager() : World(nullptr)
@@ -220,7 +231,7 @@ bool FRaytraceManager::TickAudioTrace(float /*DeltaTime*/)
 		FWriteScopeLock Lock(Listener->Lock);
 		bListenerReady = Listener->bPositionSet;
 		bListenerDirty = Listener->bDirty;
-		Listener->bDirty = false;
+		//Listener->bDirty = false;
 	}
 
 	TArray<uint32> SourceIdsToTrace;
@@ -234,7 +245,7 @@ bool FRaytraceManager::TickAudioTrace(float /*DeltaTime*/)
 				&& Result.Value->bEmitterPositionSet
 				&& !Result.Value->bTraceInFlight)
 			{
-				Result.Value->bDirty = false;
+				//Result.Value->bDirty = false;
 				Result.Value->bTraceInFlight = true;
 				SourceIdsToTrace.Add(Result.Key);
 			}
@@ -378,8 +389,8 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 	TRACE_CPUPROFILER_EVENT_SCOPE(RTA_BounceRays);
 
 	const int32 NumSources = ValidData.Num();
+	if (NumSources == 0) return;
 
-	// Reach far enough to find a surface that sees the furthest source, and no further.
 	float FurthestSourceCm = 0.f;
 	for (const FValidData& Entry : ValidData)
 	{
@@ -387,100 +398,196 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 	}
 	const float RayLength = FMath::Clamp(FurthestSourceCm * OcclusionRayLengthHeadroom,
 	                                     MinOcclusionRayLengthCm, MaxOcclusionRayLengthCm);
-
-	FCollisionQueryParams CollisionQueryParams;
-	CollisionQueryParams.bReturnPhysicalMaterial = true;
-	CollisionQueryParams.bTraceComplex = true;
-
-	FRandomStream RndStrm;
-	TArray<bool> bConnected;
-	bConnected.Reserve(NumSources);
-
-	for (int32 RayNum = 0; RayNum < RayCount; ++RayNum)
+	
+	struct FBounce
 	{
-		bConnected.Reset();
-		for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
+		FVector Point;
+		float PathLengthCm;
+		float Energy[RTA::NumBands];
+	};
+	using FRayPath = TArray<FBounce, TInlineAllocator<16>>;
+
+	TArray<FRayPath> Paths;
+	Paths.SetNum(RayCount);
+	
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(RTA_BouncePhase);
+
+		ParallelFor(RayCount, [this, &Paths, &ListenerPos, RayLength, TraceSeed](int32 RayNum)
 		{
-			bConnected.Add(ValidData[SrcIdx].bDirectLOS);
+			FCollisionQueryParams BounceParams;
+			BounceParams.bReturnPhysicalMaterial = true;
+			BounceParams.bTraceComplex = true;
+
+			FRandomStream Rnd;
+			Rnd.Initialize(HashCombine(TraceSeed, static_cast<uint32>(RayNum)));
+
+			FVector SegmentStart = ListenerPos;
+			FVector PreviousSegmentStart = ListenerPos;
+			FVector LastHitNormal = FVector::ZeroVector;
+			float LastHitScattering = RTA::DefaultScattering;
+			bool bHasHitSurface = false;
+
+			float RayEnergy[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
+			float PathLengthCm = 0.f;
+
+			FRayPath& Path = Paths[RayNum];
+
+			for (int32 Depth = 0; Depth < OcclusionMaxDepth; ++Depth)
+			{
+				const FVector RandomDir = SampleBounceDirection(
+					bHasHitSurface, SegmentStart, PreviousSegmentStart,
+					LastHitNormal, LastHitScattering, Rnd);
+
+				FHitResult HitResult;
+				World->LineTraceSingleByChannel(HitResult, SegmentStart,
+					SegmentStart + RandomDir * RayLength, ECC_Visibility, BounceParams);
+				if (!HitResult.IsValidBlockingHit())
+					break;
+
+				PathLengthCm += HitResult.Distance;
+
+				const FSurfaceAcoustics Surface = ResolveSurface(HitResult);
+				for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+				{
+					RayEnergy[Band] *= Surface.Reflected[Band];
+				}
+
+				PreviousSegmentStart = SegmentStart;
+				SegmentStart = HitResult.Location + HitResult.Normal * SurfaceBiasCm;
+				LastHitNormal = HitResult.Normal;
+				LastHitScattering = Surface.Scattering;
+				bHasHitSurface = true;
+
+				FBounce& Bounce = Path.AddDefaulted_GetRef();
+				Bounce.Point = SegmentStart;
+				Bounce.PathLengthCm = PathLengthCm;
+				FMemory::Memcpy(Bounce.Energy, RayEnergy, sizeof(RayEnergy));
+			}
+		}, EParallelForFlags::BackgroundPriority);
+	}
+
+	struct FNeeContext
+	{
+		TArray<FLossAccumulator> Loss;
+		TArray<bool> Connected;
+		bool bInitialised = false;
+	};
+
+	TArray<FNeeContext> Contexts;
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(RTA_BounceNeeRays);
+
+		const FRTABatchedTracer Tracer(World.Get(), /*bTraceComplex*/ false);
+
+		if (!Tracer.IsValid())
+		{
+			UE_LOG(LogRTA, Warning, TEXT("BounceRaysTrace: batched tracer unavailable, using engine traces"));
 		}
 
-		FVector SegmentStart = ListenerPos;
-		FVector PreviousSegmentStart = ListenerPos;
-		FVector LastHitNormal = FVector::ZeroVector;
-		float LastHitScattering = RTA::DefaultScattering;
-		bool bHasHitSurface = false;
-
-		float RayEnergy[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
-		float PathLengthCm = 0.f;
-
-		RndStrm.Initialize(HashCombine(TraceSeed, static_cast<uint32>(RayNum)));
-
-		for (int32 Depth = 0; Depth < OcclusionMaxDepth; ++Depth)
+		auto IsBlocked = [this, &Tracer](const FVector& A, const FVector& B)
 		{
-			const FVector RandomDir = SampleBounceDirection(
-				bHasHitSurface, SegmentStart, PreviousSegmentStart, LastHitNormal, LastHitScattering, RndStrm);
+			return Tracer.IsValid()
+				? Tracer.TraceTest(A, B)
+				: World->LineTraceTestByChannel(A, B, ECC_Visibility);
+		};
 
-			const FVector TraceEnd = SegmentStart + RandomDir * RayLength;
-
-			FHitResult HitResult;
-			World->LineTraceSingleByChannel(HitResult, SegmentStart, TraceEnd, ECC_Visibility, CollisionQueryParams);
-			if (!HitResult.IsValidBlockingHit())
-				break;
-
-			PathLengthCm += HitResult.Distance;
-
-			const FSurfaceAcoustics Surface = ResolveSurface(HitResult);
-			for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+		ParallelForWithTaskContext(Contexts, RayCount,
+			[&Paths, &ValidData, &IsBlocked, NumSources](FNeeContext& Ctx, int32 RayNum)
 			{
-				RayEnergy[Band] *= Surface.Reflected[Band];
-			}
+				if (!Ctx.bInitialised)
+				{
+					Ctx.Loss.Init(FLossAccumulator(), NumSources);
+					Ctx.Connected.SetNumUninitialized(NumSources);
+					Ctx.bInitialised = true;
+				}
 
-			PreviousSegmentStart = SegmentStart;
-			SegmentStart = HitResult.Location + HitResult.Normal * SurfaceBiasCm;
-			LastHitNormal = HitResult.Normal;
-			LastHitScattering = Surface.Scattering;
-			bHasHitSurface = true;
-
-			{
-				TRACE_CPUPROFILER_EVENT_SCOPE(RTA_BounceNeeRays);
 				for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
 				{
-					if (bConnected[SrcIdx])
-						continue;
+					Ctx.Connected[SrcIdx] = ValidData[SrcIdx].bDirectLOS;
+				}
 
-					FHitResult NEEHitResult;
-					const bool bNEEHit = World->LineTraceSingleByChannel(
-						NEEHitResult, SegmentStart, ValidData[SrcIdx].EmitterPos, ECC_Visibility);
-
-					if (!bNEEHit)
+				for (const FBounce& Bounce : Paths[RayNum])
+				{
+					for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
 					{
-						const float ShadowDistanceCm = FVector::Dist(SegmentStart, ValidData[SrcIdx].EmitterPos);
-						const float TotalPathMetres = (PathLengthCm + ShadowDistanceCm) * RTA::CmToMetres;
+						if (Ctx.Connected[SrcIdx])
+							continue;
+
+						if (IsBlocked(Bounce.Point, ValidData[SrcIdx].EmitterPos))
+							continue;
+
+						const float ShadowDistanceCm = FVector::Dist(Bounce.Point, ValidData[SrcIdx].EmitterPos);
+						const float TotalPathMetres = (Bounce.PathLengthCm + ShadowDistanceCm) * RTA::CmToMetres;
 
 						for (int32 Band = 0; Band < RTA::NumBands; ++Band)
 						{
-							const float AirAtten = FMath::Exp(
-								-RTA::AirAbsorptionPerMetre[Band] * TotalPathMetres);
-							const float ArrivingEnergy = FMath::Clamp(RayEnergy[Band] * AirAtten, 0.f, 1.f);
-							TotalLoss[SrcIdx].Bands[Band] += (1.f - ArrivingEnergy);
+							const float AirAtten = FMath::Exp(-RTA::AirAbsorptionPerMetre[Band] * TotalPathMetres);
+							const float ArrivingEnergy = FMath::Clamp(Bounce.Energy[Band] * AirAtten, 0.f, 1.f);
+							Ctx.Loss[SrcIdx].Bands[Band] += (1.f - ArrivingEnergy);
 						}
 
-						bConnected[SrcIdx] = true;
+						Ctx.Connected[SrcIdx] = true;
 					}
 				}
-			}
-		}
+
+				for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
+				{
+					if (!Ctx.Connected[SrcIdx])
+					{
+						for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+						{
+							Ctx.Loss[SrcIdx].Bands[Band] += 1.f;
+						}
+					}
+				}
+			},
+			EParallelForFlags::BackgroundPriority);
+	}   // lock released
+
+	for (const FNeeContext& Ctx : Contexts)
+	{
+		if (!Ctx.bInitialised) continue;
 
 		for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
 		{
-			if (!bConnected[SrcIdx])
+			for (int32 Band = 0; Band < RTA::NumBands; ++Band)
 			{
-				for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+				TotalLoss[SrcIdx].Bands[Band] += Ctx.Loss[SrcIdx].Bands[Band];
+			}
+		}
+	}
+
+	if (GRTAValidateBatchedTrace != 0)
+	{
+		TArray<TPair<FVector, FVector>> Pairs;
+		for (int32 RayNum = 0; RayNum < RayCount && Pairs.Num() < 2000; RayNum += 7)
+		{
+			for (const FBounce& Bounce : Paths[RayNum])
+			{
+				for (int32 SrcIdx = 0; SrcIdx < NumSources && Pairs.Num() < 2000; SrcIdx += 5)
 				{
-					TotalLoss[SrcIdx].Bands[Band] += 1.f;
+					Pairs.Emplace(Bounce.Point, ValidData[SrcIdx].EmitterPos);
 				}
 			}
 		}
+
+		TArray<bool> Fast;
+		Fast.Reserve(Pairs.Num());
+		{
+			const FRTABatchedTracer Tracer(World.Get(), false);
+			for (const auto& P : Pairs) Fast.Add(Tracer.TraceTest(P.Key, P.Value));
+		}
+
+		int32 Mismatches = 0;
+		for (int32 i = 0; i < Pairs.Num(); ++i)
+		{
+			const bool bSlow = World->LineTraceTestByChannel(Pairs[i].Key, Pairs[i].Value, ECC_Visibility);
+			Mismatches += (Fast[i] != bSlow);
+		}
+
+		UE_LOG(LogRTA, Log, TEXT("BatchedTrace validation: %d / %d mismatches"), Mismatches, Pairs.Num());
 	}
 }
 

@@ -155,6 +155,7 @@ private:
 	static constexpr float AudioTraceTickInterval = 0.033f;
 	static constexpr float RoomProbeTickInterval  = 0.25f;
 	static constexpr float MinPositionDeltaForDirty = 5.f;
+	static constexpr float ClusterSizeCm = 300.f;   // 3 m
 
 	static constexpr int32 RayCount = 1028;
 	static constexpr int32 OcclusionMaxDepth = 8;

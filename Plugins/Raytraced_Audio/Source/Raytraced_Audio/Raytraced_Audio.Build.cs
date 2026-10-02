@@ -36,10 +36,13 @@ public class Raytraced_Audio : ModuleRules
 			{
 				"Slate",
 				"SlateCore",
-				"SignalProcessing"
+				"SignalProcessing",
+				"Chaos", 
+				"PhysicsCore"
 				// ... add private dependencies that you statically link with here ...	
 			}
 			);
+		bValidateInternalApi = false;
 		
 		
 		DynamicallyLoadedModuleNames.AddRange(
