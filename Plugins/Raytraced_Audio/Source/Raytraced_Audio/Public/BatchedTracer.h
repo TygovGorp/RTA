@@ -17,7 +17,6 @@ public:
 
 	bool IsValid() const { return Accel != nullptr; }
 
-	/** True if anything blocking lies between Start and End. Safe to call from any thread. */
 	bool TraceTest(const FVector& Start, const FVector& End) const;
 
 private:

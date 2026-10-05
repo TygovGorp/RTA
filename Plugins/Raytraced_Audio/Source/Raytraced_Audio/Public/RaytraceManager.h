@@ -3,6 +3,7 @@
 #include "RTAAcousticBands.h"
 #include "Echogram.h"
 #include "RTASeqLock.h"
+#include "RTADecayMetrics.h"
 #include "Containers/Ticker.h"
 #include "Engine/HitResult.h"
 #include "Math/RandomStream.h"
@@ -136,6 +137,10 @@ private:
 
 	bool TickRoomProbe(float DeltaTime);
 	void RunRoomProbe(uint32 TraceSeed);
+
+	/** Prints analytic predictions next to measured values when rta.Shoebox is set. */
+	void LogShoeboxReport(const FRoomResult& Published,
+		const TStaticArray<FDecayMetric, RTA::NumBands>& DecayMetrics, int32 ProbeCount) const;
 	static void ComputeEyringRT60(float MeanFreePathMetres,
 	                              const float MeanAbsorption[RTA::NumBands],
 	                              float OutRT60[RTA::NumBands]);

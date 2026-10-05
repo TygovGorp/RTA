@@ -13,6 +13,7 @@
 #include "Misc/DateTime.h"
 #include "Async/ParallelFor.h"
 #include "BatchedTracer.h"
+#include "HAL/IConsoleManager.h"
 
 namespace
 {
@@ -20,6 +21,67 @@ namespace
 	static FAutoConsoleVariableRef CVarRTAValidateBatchedTrace(
 		TEXT("rta.ValidateBatchedTrace"), GRTAValidateBatchedTrace,
 		TEXT("Compare the batched tracer against UWorld::LineTraceTestByChannel on a sample."),
+		ECVF_Default);
+	
+	static float GRTAProbeShadowThreshold = 1e-5f;
+	static FAutoConsoleVariableRef CVarRTAProbeShadowThreshold(
+		TEXT("rta.ProbeShadowThreshold"), GRTAProbeShadowThreshold,
+		TEXT("Room probe: expected deposit below which shadow rays are rouletted. 0 = always trace."),
+		ECVF_Default);
+	
+	static int32 GRTAProbeParallel = 1;
+	static FAutoConsoleVariableRef CVarRTAProbeParallel(
+		TEXT("rta.ProbeParallel"), GRTAProbeParallel,
+		TEXT("Room probe: 1 = ParallelFor, 0 = single thread."),
+		ECVF_Default);
+
+	static int32 GRTAValidateProbeTrace = 0;
+	static FAutoConsoleVariableRef CVarRTAValidateProbeTrace(
+		TEXT("rta.ValidateProbeTrace"), GRTAValidateProbeTrace,
+		TEXT("Compare the probe's batched shadow rays against the engine path on a sample."),
+		ECVF_Default);
+
+	constexpr float ShadowRouletteMinP = 0.05f;
+
+	// --- Shoebox validation -------------------------------------------------------------
+	// Describe a sealed rectangular room with one uniform material, and every probe prints
+	// the analytic predictions next to what the tracer measured.
+	static int32 GRTAShoebox = 0;
+	static FAutoConsoleVariableRef CVarRTAShoebox(
+		TEXT("rta.Shoebox"), GRTAShoebox,
+		TEXT("1 = print a validation report against analytic predictions every probe."),
+		ECVF_Default);
+
+	// Inner dimensions in metres: the air volume, not the outer edges of the wall actors.
+	static float GRTAShoeboxX = 2.f;
+	static float GRTAShoeboxY = 2.f;
+	static float GRTAShoeboxZ = 2.f;
+	static float GRTAShoeboxAlpha = 0.2f;
+	static FAutoConsoleVariableRef CVarRTAShoeboxX(TEXT("rta.Shoebox.X"), GRTAShoeboxX,
+		TEXT("Shoebox inner size along X, metres."), ECVF_Default);
+	static FAutoConsoleVariableRef CVarRTAShoeboxY(TEXT("rta.Shoebox.Y"), GRTAShoeboxY,
+		TEXT("Shoebox inner size along Y, metres."), ECVF_Default);
+	static FAutoConsoleVariableRef CVarRTAShoeboxZ(TEXT("rta.Shoebox.Z"), GRTAShoeboxZ,
+		TEXT("Shoebox inner size along Z, metres."), ECVF_Default);
+	static FAutoConsoleVariableRef CVarRTAShoeboxAlpha(TEXT("rta.Shoebox.Alpha"), GRTAShoeboxAlpha,
+		TEXT("Uniform absorption of every shoebox surface."), ECVF_Default);
+
+	// Tolerances. MFP is expected to read slightly low: each ray's first segment runs from
+	// the listener, an interior point, so it is shorter than a wall-to-wall chord.
+	constexpr double ShoeboxMfpTolerancePct = 2.0;
+	constexpr double ShoeboxT30TolerancePct = 10.0;
+	constexpr float  ShoeboxAlphaTolerance  = 0.005f;
+
+	// Ray energy below which the room probe starts Russian roulette. Above it every ray
+	// survives, so the echogram tail is fully sampled down to this level. Roulette from a
+	// fixed depth kept surviving rays proportional to energy, which is right for total
+	// energy but left a 2 m shoebox with 23 samples between 100 and 150 ms and none after,
+	// so the tail ended at a random bin and T30 could not be measured.
+	// Must sit well below the -35 dB T30 needs: -50 dB leaves the truncation detector room.
+	static float GRTAProbeRouletteEnergy = 1e-5f;
+	static FAutoConsoleVariableRef CVarRTAProbeRouletteEnergy(
+		TEXT("rta.ProbeRouletteEnergy"), GRTAProbeRouletteEnergy,
+		TEXT("Room probe: ray energy below which roulette begins. Lower = longer, costlier tail."),
 		ECVF_Default);
 }
 
@@ -692,148 +754,311 @@ void FRaytraceManager::RunRoomProbe(uint32 TraceSeed)
 		ListenerPos = Listener->Position;
 	}
 
-	FEchogram& Fresh = Listener->FreshEchogram;
-	Fresh.Reset();
+	const EParallelForFlags PFFlags = (GRTAProbeParallel != 0)
+		? EParallelForFlags::BackgroundPriority
+		: EParallelForFlags::ForceSingleThread;
 
-	FCollisionQueryParams CollisionQueryParams;
-	CollisionQueryParams.bReturnPhysicalMaterial = true;
-	CollisionQueryParams.bTraceComplex = true;
-
-	double PathLengthSumCm = 0.0;
-	double AbsorptionSum[RTA::NumBands] = {};
-	int32  HitCount = 0;
-	int32  EscapedRays = 0;
-	float  MaxHitDistanceCm = 0.f;
-
-	FRandomStream RndStrm;
-
-	for (int32 RayNum = 0; RayNum < RayCount; ++RayNum)
+	struct FProbeBounce
 	{
-		FVector SegmentStart = ListenerPos;
-		FVector PreviousSegmentStart = ListenerPos;
-		FVector LastHitNormal = FVector::ZeroVector;
-		float LastHitScattering = RTA::DefaultScattering;
-		bool bHasHitSurface = false;
+		FVector Point;
+		FVector Normal;
+		float PathLengthCm;
+		float Scattering;
+		float Outgoing[RTA::NumBands];
+	};
 
-		float RayEnergy[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
-		float PathLengthCm = 0.f;
+	TArray<TArray<FProbeBounce>> Paths;
+	Paths.SetNum(RayCount);
 
-		RndStrm.Initialize(HashCombine(TraceSeed, static_cast<uint32>(RayNum)));
+	struct FBounceStats
+	{
+		double PathLengthSumCm = 0.0;
+		double AbsorptionSum[RTA::NumBands] = {};
+		int32  HitCount = 0;
+		int32  EscapedRays = 0;
+		float  MaxHitDistanceCm = 0.f;
+	};
 
-		for (int32 Depth = 0; Depth < ProbeMaxDepth; ++Depth)
-		{
-			const float RemainingPathCm = FEchogram::MaxPathCm - PathLengthCm;
-			if (RemainingPathCm <= 0.f)
+	TArray<FBounceStats> BounceStats;
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(RTA_ProbeBounce);
+
+		// Read once so every worker uses the same threshold for the whole probe.
+		const float RouletteEnergy = FMath::Max(GRTAProbeRouletteEnergy, KINDA_SMALL_NUMBER);
+
+		ParallelForWithTaskContext(BounceStats, RayCount,
+			[this, &Paths, &ListenerPos, TraceSeed, RouletteEnergy](FBounceStats& S, int32 RayNum)
 			{
-				break;
-			}
+				FCollisionQueryParams Params;
+				Params.bReturnPhysicalMaterial = true;
+				Params.bTraceComplex = true;
 
-			const FVector RandomDir = SampleBounceDirection(
-				bHasHitSurface, SegmentStart, PreviousSegmentStart, LastHitNormal, LastHitScattering, RndStrm);
+				FRandomStream Rnd;
+				Rnd.Initialize(HashCombine(TraceSeed, static_cast<uint32>(RayNum)));
 
-			const FVector TraceEnd = SegmentStart + RandomDir * RemainingPathCm;
+				FVector SegmentStart = ListenerPos;
+				FVector PreviousSegmentStart = ListenerPos;
+				FVector LastHitNormal = FVector::ZeroVector;
+				float LastHitScattering = RTA::DefaultScattering;
+				bool bHasHitSurface = false;
 
-			FHitResult HitResult;
-			World->LineTraceSingleByChannel(HitResult, SegmentStart, TraceEnd, ECC_Visibility, CollisionQueryParams);
-			if (!HitResult.IsValidBlockingHit())
-			{
-				++EscapedRays;
-				for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+				float RayEnergy[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
+				float PathLengthCm = 0.f;
+
+				TArray<FProbeBounce>& Path = Paths[RayNum];
+				Path.Reserve(32);
+
+				for (int32 Depth = 0; Depth < ProbeMaxDepth; ++Depth)
 				{
-					AbsorptionSum[Band] += 1.0;
-				}
-				++HitCount;
-				break;
-			}
+					const float RemainingPathCm = FEchogram::MaxPathCm - PathLengthCm;
+					if (RemainingPathCm <= 0.f)
+						break;
 
-			PathLengthCm += HitResult.Distance;
-			PathLengthSumCm += HitResult.Distance;
-			MaxHitDistanceCm = FMath::Max(MaxHitDistanceCm, HitResult.Distance);
-			++HitCount;
+					const FVector RandomDir = SampleBounceDirection(
+						bHasHitSurface, SegmentStart, PreviousSegmentStart,
+						LastHitNormal, LastHitScattering, Rnd);
 
-			const FSurfaceAcoustics Surface = ResolveSurface(HitResult);
-			for (int32 Band = 0; Band < RTA::NumBands; ++Band)
-			{
-				AbsorptionSum[Band] += Surface.Absorption[Band];
-			}
+					FHitResult HitResult;
+					World->LineTraceSingleByChannel(HitResult, SegmentStart,
+						SegmentStart + RandomDir * RemainingPathCm, ECC_Visibility, Params);
 
-			{
-				const FVector HitPoint = HitResult.Location;
-				const FVector ToListener = ListenerPos - HitPoint;
-
-				const float ShadowDistanceCm = FMath::Max(ToListener.Size(), RTA::MinReceiverDistanceCm);
-				const FVector DirectionToListener = ToListener / ShadowDistanceCm;
-
-				const float CosTheta = FMath::Max(
-					FVector::DotProduct(HitResult.Normal, DirectionToListener), 0.f);
-
-				if (CosTheta > 0.f)
-				{
-					const FVector ShadowStart = HitPoint + HitResult.Normal * SurfaceBiasCm;
-
-					FHitResult ShadowHit;
-					const bool bShadowBlocked = World->LineTraceSingleByChannel(
-						ShadowHit, ShadowStart, ListenerPos, ECC_Visibility, CollisionQueryParams);
-
-					if (!bShadowBlocked)
+					if (!HitResult.IsValidBlockingHit())
 					{
-						const float TotalPathCm = PathLengthCm + ShadowDistanceCm;
-						const float TotalPathMetres = TotalPathCm * RTA::CmToMetres;
-
-						const int32 Bin = Fresh.BinFromPathLengthCm(TotalPathCm);
-
-						if (Bin > 0)
+						++S.EscapedRays;
+						for (int32 Band = 0; Band < RTA::NumBands; ++Band)
 						{
-							const float SolidAngleFraction =
-								FMath::Square(RTA::ReceiverRadiusCm) / FMath::Square(ShadowDistanceCm);
-							const float GeometryTerm = Surface.Scattering * CosTheta * SolidAngleFraction;
+							S.AbsorptionSum[Band] += 1.0;
+						}
+						++S.HitCount;
+						break;
+					}
 
-							for (int32 Band = 0; Band < RTA::NumBands; ++Band)
-							{
-								const float AirAtten = FMath::Exp(
-									-RTA::AirAbsorptionPerMetre[Band] * TotalPathMetres);
+					PathLengthCm += HitResult.Distance;
+					S.PathLengthSumCm += HitResult.Distance;
+					S.MaxHitDistanceCm = FMath::Max(S.MaxHitDistanceCm, HitResult.Distance);
+					++S.HitCount;
 
-								Fresh.At(Band, Bin) +=
-									RayEnergy[Band] * Surface.Reflected[Band] * GeometryTerm * AirAtten;
-							}
+					const FSurfaceAcoustics Surface = ResolveSurface(HitResult);
+					for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+					{
+						S.AbsorptionSum[Band] += Surface.Absorption[Band];
+					}
+
+					FProbeBounce& Bounce = Path.AddDefaulted_GetRef();
+					Bounce.Point = HitResult.Location;
+					Bounce.Normal = HitResult.Normal;
+					Bounce.PathLengthCm = PathLengthCm;
+					Bounce.Scattering = Surface.Scattering;
+					for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+					{
+						Bounce.Outgoing[Band] = RayEnergy[Band] * Surface.Reflected[Band];
+					}
+
+					for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+					{
+						RayEnergy[Band] *= Surface.Reflected[Band];
+					}
+
+					PreviousSegmentStart = SegmentStart;
+					SegmentStart = HitResult.Location + HitResult.Normal * SurfaceBiasCm;
+					LastHitNormal = HitResult.Normal;
+					LastHitScattering = Surface.Scattering;
+					bHasHitSurface = true;
+
+					float PeakEnergy = 0.f;
+					for (const float Energy : RayEnergy)
+					{
+						PeakEnergy = FMath::Max(PeakEnergy, Energy);
+					}
+
+					if (PeakEnergy < EnergyFloor)
+						break;
+
+					// Roulette relative to the tail level still needed, not from a fixed depth.
+					// Survival q = E / threshold, so a surviving ray renormalised by 1/q sits back
+					// at the threshold and the estimate stays unbiased.
+					if (PeakEnergy < RouletteEnergy)
+					{
+						const float q = FMath::Clamp(PeakEnergy / RouletteEnergy, RouletteQMin, RouletteQMax);
+						if (Rnd.FRand() > q)
+							break;
+
+						for (float& Energy : RayEnergy)
+						{
+							Energy /= q;
 						}
 					}
 				}
-			}
+			},
+			PFFlags);
+	}
 
-			for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+	FBounceStats Stats;
+	for (const FBounceStats& S : BounceStats)
+	{
+		Stats.PathLengthSumCm += S.PathLengthSumCm;
+		for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+		{
+			Stats.AbsorptionSum[Band] += S.AbsorptionSum[Band];
+		}
+		Stats.HitCount += S.HitCount;
+		Stats.EscapedRays += S.EscapedRays;
+		Stats.MaxHitDistanceCm = FMath::Max(Stats.MaxHitDistanceCm, S.MaxHitDistanceCm);   // max, not sum
+	}
+
+	struct FShadowContext
+	{
+		FEchogram Echo;
+		int32 Considered = 0;
+		int32 OutOfWindow = 0;
+		int32 Rouletted = 0;
+		int32 Traced = 0;
+		bool bInitialised = false;
+	};
+
+	TArray<FShadowContext> ShadowContexts;
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(RTA_ProbeShadow);
+
+		const FRTABatchedTracer Tracer(World.Get(), /*bTraceComplex*/ true);
+
+		auto IsBlocked = [this, &Tracer](const FVector& A, const FVector& B)
+		{
+			if (Tracer.IsValid())
 			{
-				RayEnergy[Band] *= Surface.Reflected[Band];
+				return Tracer.TraceTest(A, B);
 			}
+			FCollisionQueryParams P;
+			P.bTraceComplex = true;
+			return World->LineTraceTestByChannel(A, B, ECC_Visibility, P);
+		};
 
-			PreviousSegmentStart = SegmentStart;
-			SegmentStart = HitResult.Location + HitResult.Normal * SurfaceBiasCm;
-			LastHitNormal = HitResult.Normal;
-			LastHitScattering = Surface.Scattering;
-			bHasHitSurface = true;
+		const float Threshold = GRTAProbeShadowThreshold;
+		const float BiasCm = SurfaceBiasCm;
 
-			float PeakEnergy = 0.f;
-			for (const float Energy : RayEnergy)
+		ParallelForWithTaskContext(ShadowContexts, RayCount,
+			[&Paths, &ListenerPos, &IsBlocked, TraceSeed, Threshold, BiasCm](FShadowContext& C, int32 RayNum)
 			{
-				PeakEnergy = FMath::Max(PeakEnergy, Energy);
-			}
-
-			if (PeakEnergy < EnergyFloor)
-				break;  
-			if (Depth >= RouletteStartDepth)
-			{
-				const float q = FMath::Clamp(PeakEnergy, RouletteQMin, RouletteQMax);
-
-
-				if (RndStrm.FRand() > q)
-					break;
-
-				for (float& Energy : RayEnergy)
+				if (!C.bInitialised)
 				{
-					Energy /= q;
+					C.Echo.Reset();
+					C.bInitialised = true;
 				}
+
+				FRandomStream ShadowRnd;
+				ShadowRnd.Initialize(HashCombine(HashCombine(TraceSeed, static_cast<uint32>(RayNum)), 0x5AD0u));
+
+				for (const FProbeBounce& Bounce : Paths[RayNum])
+				{
+					const FVector ToListener = ListenerPos - Bounce.Point;
+					const float TrueDistanceCm = ToListener.Size();
+					if (TrueDistanceCm <= KINDA_SMALL_NUMBER)
+						continue;
+
+					const float CosTheta = FVector::DotProduct(Bounce.Normal, ToListener / TrueDistanceCm);
+					if (CosTheta <= 0.f)
+						continue;
+
+					++C.Considered;
+
+					const float ShadowDistanceCm = FMath::Max(TrueDistanceCm, RTA::MinReceiverDistanceCm);
+					const float TotalPathCm = Bounce.PathLengthCm + ShadowDistanceCm;
+
+					const int32 Bin = C.Echo.BinFromPathLengthCm(TotalPathCm);
+					if (Bin <= 0)
+					{
+						++C.OutOfWindow;
+						continue;
+					}
+
+					const float TotalPathMetres = TotalPathCm * RTA::CmToMetres;
+					const float SolidAngleFraction =
+						FMath::Square(RTA::ReceiverRadiusCm) / FMath::Square(ShadowDistanceCm);
+					const float GeometryTerm = Bounce.Scattering * CosTheta * SolidAngleFraction;
+
+					float Contribution[RTA::NumBands];
+					float PeakContribution = 0.f;
+					for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+					{
+						const float AirAtten = FMath::Exp(-RTA::AirAbsorptionPerMetre[Band] * TotalPathMetres);
+						Contribution[Band] = Bounce.Outgoing[Band] * GeometryTerm * AirAtten;
+						PeakContribution = FMath::Max(PeakContribution, Contribution[Band]);
+					}
+
+					const float SurvivalP = (Threshold > 0.f)
+						? FMath::Clamp(PeakContribution / Threshold, ShadowRouletteMinP, 1.f)
+						: 1.f;
+
+					if (SurvivalP < 1.f && ShadowRnd.FRand() >= SurvivalP)
+					{
+						++C.Rouletted;
+						continue;
+					}
+
+					++C.Traced;
+
+					if (IsBlocked(Bounce.Point + Bounce.Normal * BiasCm, ListenerPos))
+						continue;
+
+					const float Weight = 1.f / SurvivalP;
+					for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+					{
+						C.Echo.At(Band, Bin) += Contribution[Band] * Weight;
+					}
+				}
+			},
+			PFFlags);
+	}   // lock released here
+
+	FEchogram& Fresh = Listener->FreshEchogram;
+	Fresh.Reset();
+
+	int32 ShadowsConsidered = 0, ShadowsOutOfWindow = 0, ShadowsRouletted = 0, ShadowsTraced = 0;
+	for (const FShadowContext& C : ShadowContexts)
+	{
+		if (!C.bInitialised) continue;
+
+		for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+		{
+			for (int32 Bin = 0; Bin < FEchogram::NumBins; ++Bin)
+			{
+				Fresh.At(Band, Bin) += C.Echo.At(Band, Bin);
 			}
 		}
+
+		ShadowsConsidered += C.Considered;
+		ShadowsOutOfWindow += C.OutOfWindow;
+		ShadowsRouletted += C.Rouletted;
+		ShadowsTraced += C.Traced;
+	}
+
+	if (GRTAValidateProbeTrace != 0)
+	{
+		TArray<TPair<FVector, FVector>> Pairs;
+		for (int32 RayNum = 0; RayNum < RayCount && Pairs.Num() < 2000; RayNum += 3)
+		{
+			for (const FProbeBounce& Bounce : Paths[RayNum])
+			{
+				if (Pairs.Num() >= 2000) break;
+				Pairs.Emplace(Bounce.Point + Bounce.Normal * SurfaceBiasCm, ListenerPos);
+			}
+		}
+
+		TArray<bool> Fast;
+		Fast.Reserve(Pairs.Num());
+		{
+			const FRTABatchedTracer Tracer(World.Get(), true);
+			for (const auto& P : Pairs) Fast.Add(Tracer.TraceTest(P.Key, P.Value));
+		}
+
+		FCollisionQueryParams P;
+		P.bTraceComplex = true;
+		int32 Mismatches = 0;
+		for (int32 i = 0; i < Pairs.Num(); ++i)
+		{
+			Mismatches += (Fast[i] != World->LineTraceTestByChannel(Pairs[i].Key, Pairs[i].Value, ECC_Visibility, P));
+		}
+		UE_LOG(LogRTA, Log, TEXT("Probe trace validation: %d / %d mismatches"), Mismatches, Pairs.Num());
 	}
 
 	const float NormFactor = 1.f /
@@ -842,33 +1067,36 @@ void FRaytraceManager::RunRoomProbe(uint32 TraceSeed)
 
 	FRoomResult Published;
 
+	// Outside the lock scope so the shoebox report can read them after publishing.
+	TStaticArray<FDecayMetric, RTA::NumBands> DecayMetrics;
+	int32 ProbeCountSnapshot = 0;
+
 	{
 		FWriteScopeLock Lock(Listener->Lock);
 
 		++Listener->ProbeCount;
+		ProbeCountSnapshot = Listener->ProbeCount;
 		Listener->AccumulatedEchogram.Accumulate(Fresh, Listener->AccumulatedEchogram.GetSmoothingAlpha());
-		
-		TStaticArray<FDecayMetric, RTA::NumBands> DecayMetrics;
+
 		for (int Band = 0; Band < RTA::NumBands; ++Band)
 		{
 			DecayMetrics[Band] = RTA::ComputeDecayMetrics(Listener->AccumulatedEchogram, Band);
 		}
 
-
-		if (HitCount > 0)
+		if (Stats.HitCount > 0)
 		{
-			Listener->MeanFreePathMetres = float(PathLengthSumCm / HitCount) * RTA::CmToMetres;
+			Listener->MeanFreePathMetres = float(Stats.PathLengthSumCm / Stats.HitCount) * RTA::CmToMetres;
 			for (int32 Band = 0; Band < RTA::NumBands; ++Band)
 			{
 				Listener->MeanAbsorption[Band] = FMath::Clamp(
-					float(AbsorptionSum[Band] / HitCount), 0.f, 0.99f);
+					float(Stats.AbsorptionSum[Band] / Stats.HitCount), 0.f, 0.99f);
 			}
 			ComputeEyringRT60(Listener->MeanFreePathMetres, Listener->MeanAbsorption, Listener->EyringRT60);
 			Listener->bHasValidEstimate = true;
 		}
 
-		Listener->EscapedRayFraction = float(EscapedRays) / float(RayCount);
-		Listener->MeanBounceDepth = float(HitCount) / float(RayCount);
+		Listener->EscapedRayFraction = float(Stats.EscapedRays) / float(RayCount);
+		Listener->MeanBounceDepth = float(Stats.HitCount) / float(RayCount);
 
 		for (int32 Band = 0; Band < RTA::NumBands; ++Band)
 		{
@@ -899,15 +1127,109 @@ void FRaytraceManager::RunRoomProbe(uint32 TraceSeed)
 		UE_LOG(LogRTA, Log,
 			TEXT("RoomProbe: MFP=%.2fm Hits=%d MeanDepth=%.1f, MeanAbsorption=[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f], Escaped=%.0f%% MaxHit=%.0fcm "
 			     "Eyring=[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f] BandTotal[1k]=%.3e LastBin[1k]=%d"),
-			Published.MeanFreePathMetres, HitCount, Published.MeanBounceDepth, 
+			Published.MeanFreePathMetres, Stats.HitCount, Published.MeanBounceDepth,
 			Published.MeanAbsorption[0], Published.MeanAbsorption[1], Published.MeanAbsorption[2],
 			Published.MeanAbsorption[3], Published.MeanAbsorption[4], Published.MeanAbsorption[5],
 			Published.EscapedRayFraction * 100.f,
-			MaxHitDistanceCm,
+			Stats.MaxHitDistanceCm,
 			Published.EyringRT60[0], Published.EyringRT60[1], Published.EyringRT60[2],
 			Published.EyringRT60[3], Published.EyringRT60[4], Published.EyringRT60[5],
 			Listener->AccumulatedEchogram.BandTotal(3),
 			Listener->AccumulatedEchogram.LastNonZeroBin(3));
+	}
+
+	UE_LOG(LogRTA, Log, TEXT("RoomProbe shadows: %d considered, %d out of window, %d rouletted, %d traced (%.0f%% skipped)"),
+		ShadowsConsidered, ShadowsOutOfWindow, ShadowsRouletted, ShadowsTraced,
+		ShadowsConsidered > 0 ? 100.f * (1.f - float(ShadowsTraced) / float(ShadowsConsidered)) : 0.f);
+
+	if (GRTAShoebox != 0)
+	{
+		LogShoeboxReport(Published, DecayMetrics, ProbeCountSnapshot);
+	}
+}
+
+void FRaytraceManager::LogShoeboxReport(const FRoomResult& Published,
+	const TStaticArray<FDecayMetric, RTA::NumBands>& DecayMetrics, int32 ProbeCount) const
+{
+	const double X = GRTAShoeboxX;
+	const double Y = GRTAShoeboxY;
+	const double Z = GRTAShoeboxZ;
+	const double Alpha = GRTAShoeboxAlpha;
+
+	if (X <= 0.0 || Y <= 0.0 || Z <= 0.0 || Alpha <= 0.0 || Alpha >= 1.0)
+	{
+		UE_LOG(LogRTA, Warning, TEXT("Shoebox: invalid dimensions or alpha; set rta.Shoebox.X/Y/Z and rta.Shoebox.Alpha"));
+		return;
+	}
+
+	const double V = X * Y * Z;
+	const double S = 2.0 * (X * Y + Y * Z + Z * X);
+	const double MfpRef = 4.0 * V / S;
+
+	auto Pct = [](double Measured, double Ref)
+	{
+		return Ref > 0.0 ? 100.0 * (Measured / Ref - 1.0) : 0.0;
+	};
+	auto Verdict = [](bool bPass) { return bPass ? TEXT("PASS") : TEXT("FAIL"); };
+
+	// 1. Sealed: any escape means a gap between the walls.
+	const double EscapedPct = double(Published.EscapedRayFraction) * 100.0;
+	const bool bSealed = Published.EscapedRayFraction <= 0.f;
+
+	// 2. Material: every band should read the uniform alpha exactly. A value of 0.10 here
+	// means the physical material is not resolving and the default is being used.
+	float MaxAlphaErr = 0.f;
+	for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+	{
+		MaxAlphaErr = FMath::Max(MaxAlphaErr, FMath::Abs(Published.MeanAbsorption[Band] - float(Alpha)));
+	}
+	const bool bMaterial = MaxAlphaErr < ShoeboxAlphaTolerance;
+
+	// 3. Mean free path against 4V/S: geometry and direction sampling only.
+	const double MfpErr = Pct(Published.MeanFreePathMetres, MfpRef);
+	const bool bMfp = FMath::Abs(MfpErr) <= ShoeboxMfpTolerancePct;
+
+	UE_LOG(LogRTA, Log, TEXT("=== Shoebox %.2f x %.2f x %.2f m  alpha %.3f  probe %d ==="), X, Y, Z, Alpha, ProbeCount);
+	UE_LOG(LogRTA, Log, TEXT("  1 Sealed     escaped %.2f%%                                  %s"),
+		EscapedPct, Verdict(bSealed));
+	UE_LOG(LogRTA, Log, TEXT("  2 Material   max |alpha - %.3f| = %.4f                     %s"),
+		Alpha, MaxAlphaErr, Verdict(bMaterial));
+	UE_LOG(LogRTA, Log, TEXT("  3 MFP        %.4f m  vs 4V/S %.4f m  (%+.2f%%)             %s"),
+		Published.MeanFreePathMetres, MfpRef, MfpErr, Verdict(bMfp));
+
+	// 4 and 5, per band. "traced" is Eyring from the traced MFP and mean absorption;
+	// "T30" is the Schroeder fit to the accumulated echogram.
+	UE_LOG(LogRTA, Log, TEXT("  4/5    band   analytic    traced (err)        T30 (err)         |R|   curv   win"));
+
+	for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+	{
+		const double M = RTA::AirAbsorptionPerMetre[Band];
+		const double Analytic = 0.161 * V / (-S * FMath::Loge(1.0 - Alpha) + 4.0 * M * V);
+
+		const FDecayMetric& D = DecayMetrics[Band];
+		const double TracedErr = Pct(Published.EyringRT60[Band], Analytic);
+		const double T30Err = D.bT30Valid ? Pct(D.T30, Analytic) : 0.0;
+		const bool bT30 = D.bT30Valid && FMath::Abs(T30Err) <= ShoeboxT30TolerancePct;
+
+		const FString T30Text = D.bT30Valid
+			? FString::Printf(TEXT("%7.3f s (%+5.1f%%)"), D.T30, T30Err)
+			: FString(TEXT("    invalid       "));
+
+		UE_LOG(LogRTA, Log, TEXT("       %5.0f Hz  %7.3f s  %7.3f s (%+5.1f%%)  %s  %5.3f  %+5.1f%%  %d   %s"),
+			RTA::FrequencyBands[Band], Analytic,
+			Published.EyringRT60[Band], TracedErr,
+			*T30Text,
+			FMath::Abs(D.T30_R), D.CurvaturePercent, D.bWindowSufficient ? 1 : 0,
+			Verdict(bT30));
+	}
+
+	if (!bSealed || !bMaterial)
+	{
+		UE_LOG(LogRTA, Log, TEXT("  Checks 1-2 failed: fix the room or the material before reading 3-5."));
+	}
+	else if (ProbeCount < 10)
+	{
+		UE_LOG(LogRTA, Log, TEXT("  Still converging (%d probes); T30 will drift until about 10."), ProbeCount);
 	}
 }
 
