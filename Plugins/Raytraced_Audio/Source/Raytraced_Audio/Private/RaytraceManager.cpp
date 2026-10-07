@@ -14,6 +14,7 @@
 #include "Async/ParallelFor.h"
 #include "BatchedTracer.h"
 #include "HAL/IConsoleManager.h"
+#include "DrawDebugHelpers.h"
 
 namespace
 {
@@ -78,6 +79,12 @@ namespace
 	// energy but left a 2 m shoebox with 23 samples between 100 and 150 ms and none after,
 	// so the tail ended at a random bin and T30 could not be measured.
 	// Must sit well below the -35 dB T30 needs: -50 dB leaves the truncation detector room.
+	static int32 GRTADebugDrawArrival = 0;
+	static FAutoConsoleVariableRef CVarRTADebugDrawArrival(
+		TEXT("rta.DebugDrawArrival"), GRTADebugDrawArrival,
+		TEXT("Draw each source's true direction (red) and apparent direction (green)."),
+		ECVF_Default);
+
 	static float GRTAProbeRouletteEnergy = 1e-5f;
 	static FAutoConsoleVariableRef CVarRTAProbeRouletteEnergy(
 		TEXT("rta.ProbeRouletteEnergy"), GRTAProbeRouletteEnergy,
@@ -278,8 +285,86 @@ FRaytraceManager::FSurfaceAcoustics FRaytraceManager::ResolveSurface(const FHitR
 	return Out;
 }
 
+void FRaytraceManager::DrawArrivalDebug() const
+{
+#if ENABLE_DRAW_DEBUG
+	if (GRTADebugDrawArrival == 0) return;
+
+	UWorld* DrawWorld = World.Get();
+	if (!DrawWorld || !Listener.IsValid()) return;
+
+	FVector ListenerPos;
+	{
+		FReadScopeLock Lock(Listener->Lock);
+		if (!Listener->bPositionSet) return;
+		ListenerPos = Listener->Position;
+	}
+
+	// The listener usually sits at the camera, where a line starting exactly at the eye is hard
+	// to see. Start slightly below it.
+	const FVector Origin = ListenerPos - FVector(0.f, 0.f, 15.f);
+
+	// One trace tick plus a margin, so lines refresh without flickering or piling up.
+	const float LifeTime = AudioTraceTickInterval * 1.5f;
+
+	// Snapshot under the lock, draw after it, so the results lock is held only briefly.
+	TArray<TPair<FVector, FSourceResult>> Snapshot;
+	{
+		FReadScopeLock Lock(ResultsLock);
+		Snapshot.Reserve(Results.Num());
+
+		for (const TTuple<uint32, TSharedPtr<FSourceRayData>>& Entry : Results)
+		{
+			FVector EmitterPos;
+			bool bPositionSet = false;
+			{
+				FReadScopeLock SourceLock(Entry.Value->Lock);
+				bPositionSet = Entry.Value->bEmitterPositionSet;
+				EmitterPos = Entry.Value->EmitterPosition;
+			}
+			if (!bPositionSet) continue;
+
+			FSourceResult Result;
+			if (!Entry.Value->Result.TryRead(Result) || !Result.bHasValidEstimate) continue;
+
+			Snapshot.Emplace(EmitterPos, Result);
+		}
+	}
+
+	for (const TPair<FVector, FSourceResult>& Item : Snapshot)
+	{
+		const FVector& EmitterPos = Item.Key;
+		const FSourceResult& Result = Item.Value;
+
+		// Recomputed from the current listener instead of using Result.VirtualPosition, which was
+		// placed from wherever the listener stood when the trace ran.
+		const float Distance = FVector::Dist(ListenerPos, EmitterPos);
+		const FVector Apparent = Origin + Result.ArrivalDirection * Distance;
+
+		// Where the source really is: thin red.
+		DrawDebugLine(DrawWorld, Origin, EmitterPos, FColor::Red, false, LifeTime, 0, 1.f);
+
+		// Where it is heard from: thick green.
+		DrawDebugLine(DrawWorld, Origin, Apparent, FColor::Green, false, LifeTime, 0, 3.f);
+
+		// Sphere sized by spread: small when the energy arrives from one direction, large when it
+		// arrives from everywhere.
+		const float Radius = FMath::Lerp(10.f, 80.f, 1.f - Result.ArrivalFocus);
+		DrawDebugSphere(DrawWorld, Apparent, Radius, 12, FColor::Green, false, LifeTime, 0, 1.f);
+
+		DrawDebugString(DrawWorld, Apparent + FVector(0.f, 0.f, Radius + 10.f),
+			FString::Printf(TEXT("focus %.2f"), Result.ArrivalFocus),
+			nullptr, FColor::White, LifeTime);
+	}
+#endif
+}
+
 bool FRaytraceManager::TickAudioTrace(float /*DeltaTime*/)
 {
+	// Before the in-flight early-out, so it draws every tick. The core ticker runs on the game
+	// thread, which is where debug drawing has to happen.
+	DrawArrivalDebug();
+
 	bool bExpected = false;
 	if (!bAudioTraceRunning.compare_exchange_strong(bExpected, true))
 	{
@@ -369,11 +454,14 @@ void FRaytraceManager::RunAudioTrace(const TArray<uint32>& SourceIds, uint32 Tra
 	TArray<FLossAccumulator> TotalLoss;
 	TotalLoss.Init(FLossAccumulator(), ValidData.Num());
 
-	BounceRaysTrace(ListenerPos, ValidData, TraceSeed, TotalLoss);
+	TArray<FArrivalAccumulator> TotalArrival;
+	TotalArrival.Init(FArrivalAccumulator(), ValidData.Num());
+
+	BounceRaysTrace(ListenerPos, ValidData, TraceSeed, TotalLoss, TotalArrival);
 
 	for (int32 SrcIdx = 0; SrcIdx < ValidData.Num(); ++SrcIdx)
 	{
-		TraceWriteBack(ValidData, TotalLoss, SrcIdx);
+		TraceWriteBack(ListenerPos, ValidData, TotalLoss, TotalArrival, SrcIdx);
 	}
 }
 
@@ -446,7 +534,7 @@ bool FRaytraceManager::GatherDirectData(const FVector& ListenerPos, const TArray
 }
 
 void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<FValidData>& ValidData,
-	uint32 TraceSeed, TArray<FLossAccumulator>& TotalLoss) const
+	uint32 TraceSeed, TArray<FLossAccumulator>& TotalLoss, TArray<FArrivalAccumulator>& TotalArrival) const
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(RTA_BounceRays);
 
@@ -532,8 +620,10 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 	struct FNeeContext
 	{
 		TArray<FLossAccumulator> Loss;
-		TArray<bool> Connected;
-		bool bInitialised = false;
+		TArray<FVector> ArrivalSum;       // sum of ArrivingEnergy * FirstDir, per source
+		TArray<float>   ArrivalEnergy;    // sum of ArrivingEnergy, per source
+		TArray<bool>    Connected;
+		bool            bInitialised = false;
 	};
 
 	TArray<FNeeContext> Contexts;
@@ -556,11 +646,13 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 		};
 
 		ParallelForWithTaskContext(Contexts, RayCount,
-			[&Paths, &ValidData, &IsBlocked, NumSources](FNeeContext& Ctx, int32 RayNum)
+			[&Paths, &ValidData, &IsBlocked, &ListenerPos, NumSources](FNeeContext& Ctx, int32 RayNum)
 			{
 				if (!Ctx.bInitialised)
 				{
 					Ctx.Loss.Init(FLossAccumulator(), NumSources);
+					Ctx.ArrivalSum.Init(FVector::ZeroVector, NumSources);
+					Ctx.ArrivalEnergy.Init(0.f, NumSources);
 					Ctx.Connected.SetNumUninitialized(NumSources);
 					Ctx.bInitialised = true;
 				}
@@ -570,7 +662,17 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 					Ctx.Connected[SrcIdx] = ValidData[SrcIdx].bDirectLOS;
 				}
 
-				for (const FBounce& Bounce : Paths[RayNum])
+				const FRayPath& Path = Paths[RayNum];
+
+				// By reciprocity, a ray leaving the listener in direction d carries sound arriving
+				// from d, whichever later bounce made the connection. A path that goes ceiling ->
+				// wall -> source is heard from the ceiling, not from the wall, so the first
+				// segment is the arrival direction for every path this ray completes.
+				const FVector FirstDir = Path.Num() > 0
+					? (Path[0].Point - ListenerPos).GetSafeNormal()
+					: FVector::ZeroVector;
+
+				for (const FBounce& Bounce : Path)
 				{
 					for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
 					{
@@ -583,12 +685,21 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 						const float ShadowDistanceCm = FVector::Dist(Bounce.Point, ValidData[SrcIdx].EmitterPos);
 						const float TotalPathMetres = (Bounce.PathLengthCm + ShadowDistanceCm) * RTA::CmToMetres;
 
+						float MeanArriving = 0.f;
 						for (int32 Band = 0; Band < RTA::NumBands; ++Band)
 						{
 							const float AirAtten = FMath::Exp(-RTA::AirAbsorptionPerMetre[Band] * TotalPathMetres);
 							const float ArrivingEnergy = FMath::Clamp(Bounce.Energy[Band] * AirAtten, 0.f, 1.f);
 							Ctx.Loss[SrcIdx].Bands[Band] += (1.f - ArrivingEnergy);
+							MeanArriving += ArrivingEnergy;
 						}
+						MeanArriving /= float(RTA::NumBands);
+
+						// Weighted by what the path delivered, not by its loss: a path that brings
+						// more sound should pull the direction harder. Sums, not a running average,
+						// so the result is independent of thread scheduling and merges exactly.
+						Ctx.ArrivalSum[SrcIdx]    += FirstDir * MeanArriving;
+						Ctx.ArrivalEnergy[SrcIdx] += MeanArriving;
 
 						Ctx.Connected[SrcIdx] = true;
 					}
@@ -618,6 +729,9 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 			{
 				TotalLoss[SrcIdx].Bands[Band] += Ctx.Loss[SrcIdx].Bands[Band];
 			}
+
+			TotalArrival[SrcIdx].Sum    += Ctx.ArrivalSum[SrcIdx];
+			TotalArrival[SrcIdx].Energy += Ctx.ArrivalEnergy[SrcIdx];
 		}
 	}
 
@@ -653,12 +767,54 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 	}
 }
 
-void FRaytraceManager::TraceWriteBack(const TArray<FValidData>& ValidData,
-	const TArray<FLossAccumulator>& TotalLoss, const int32 SrcIdx) const
+void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<FValidData>& ValidData,
+	const TArray<FLossAccumulator>& TotalLoss, const TArray<FArrivalAccumulator>& TotalArrival,
+	const int32 SrcIdx) const
 {
-	const TSharedPtr<FSourceRayData>& RayData = ValidData[SrcIdx].SourceData;
+	const FValidData& Data = ValidData[SrcIdx];
+	const TSharedPtr<FSourceRayData>& RayData = Data.SourceData;
 
 	FSourceResult Published;
+
+	// --- Arrival direction, computed outside the lock -------------------------------------
+	// Same weights as the level below, so direction and loudness agree about where the energy
+	// comes from. The transmitted part travels straight through the wall along the direct line;
+	// the indirect part arrives along the energy-weighted mean of the paths' first segments.
+	const FVector ToSource = Data.EmitterPos - ListenerPos;
+	const float SourceDistanceCm = ToSource.Size();
+	const FVector DirToSource = SourceDistanceCm > KINDA_SMALL_NUMBER
+		? ToSource / SourceDistanceCm
+		: FVector::ForwardVector;
+
+	// With clear line of sight DirectTransmissionEnergy keeps its default of 1, so the direct
+	// weight is 1, the indirect weight is 0 and the source is heard from where it is.
+	float MeanTransmission = 0.f;
+	for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+	{
+		MeanTransmission += Data.DirectTransmissionEnergy[Band];
+	}
+	MeanTransmission = FMath::Clamp(MeanTransmission / float(RTA::NumBands), 0.f, 1.f);
+
+	const FArrivalAccumulator& Arrival = TotalArrival[SrcIdx];
+
+	// Arrival.Energy / RayCount is the band-average of the indirect energy the level formula
+	// uses, since unconnected rays contribute nothing to either.
+	const float IndirectFraction = Arrival.Energy / float(RayCount);
+	const float DirectWeight   = MeanTransmission;
+	const float IndirectWeight = (1.f - MeanTransmission) * IndirectFraction;
+	const float TotalWeight    = DirectWeight + IndirectWeight;
+
+	// Mean indirect direction; its length is already 0..1.
+	const FVector IndirectMean = Arrival.Energy > KINDA_SMALL_NUMBER
+		? Arrival.Sum / Arrival.Energy
+		: FVector::ZeroVector;
+
+	// Normalised by total weight so the length is the focus, on a scale that stays consistent
+	// from pass to pass. If nothing reaches the listener at all, the source is silent anyway and
+	// the direct line is as good a direction as any.
+	const FVector RawArrival = TotalWeight > KINDA_SMALL_NUMBER
+		? (DirToSource * DirectWeight + IndirectMean * IndirectWeight) / TotalWeight
+		: DirToSource;
 
 	{
 		FWriteScopeLock Lock(RayData->Lock);
@@ -681,6 +837,12 @@ void FRaytraceManager::TraceWriteBack(const TArray<FValidData>& ValidData,
 			? FMath::Lerp(RayData->DirectLowpassCutoffHz, ValidData[SrcIdx].AirAbsorptionCutoffHz, OcclusionSmoothingAlpha)
 			: ValidData[SrcIdx].AirAbsorptionCutoffHz;
 
+		// Smooth the vector, not the unit direction. When successive passes disagree the vector
+		// shortens, which lowers the focus, instead of the direction snapping between openings.
+		RayData->SmoothedArrival = RayData->bHasValidEstimate
+			? FMath::Lerp(RayData->SmoothedArrival, RawArrival, OcclusionSmoothingAlpha)
+			: RawArrival;
+
 		RayData->bHasValidEstimate = true;
 
 		for (int32 Band = 0; Band < RTA::NumBands; ++Band)
@@ -688,17 +850,33 @@ void FRaytraceManager::TraceWriteBack(const TArray<FValidData>& ValidData,
 			Published.DirectTransmissionLoss[Band] = RayData->DirectTransmissionLoss[Band];
 		}
 		Published.DirectLowpassCutoffHz = RayData->DirectLowpassCutoffHz;
+
+		const float Focus = RayData->SmoothedArrival.Size();
+		Published.ArrivalDirection = Focus > KINDA_SMALL_NUMBER
+			? RayData->SmoothedArrival / Focus
+			: DirToSource;
+		Published.ArrivalFocus = FMath::Clamp(Focus, 0.f, 1.f);
+
+		// True distance, not path length: the longer path's loss is already in the level.
+		Published.VirtualPosition = ListenerPos + Published.ArrivalDirection * SourceDistanceCm;
+
 		Published.bHasValidEstimate = true;
 	}
 
 	RayData->Result.Write(Published);
 
-	UE_LOG(LogRTA, Verbose, TEXT("SourceId=%u Loss=[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f] CutoffHz=%.0f"),
-		ValidData[SrcIdx].SourceId,
+	// Off-axis angle: how far the heard direction has moved from the true one.
+	const float OffAxisDeg = FMath::RadiansToDegrees(FMath::Acos(
+		FMath::Clamp(FVector::DotProduct(Published.ArrivalDirection, DirToSource), -1.f, 1.f)));
+
+	UE_LOG(LogRTA, Verbose, TEXT("SourceId=%u Loss=[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f] CutoffHz=%.0f Arrival=(%.2f,%.2f,%.2f) OffAxis=%.0fdeg Focus=%.2f"),
+		Data.SourceId,
 		Published.DirectTransmissionLoss[0], Published.DirectTransmissionLoss[1],
 		Published.DirectTransmissionLoss[2], Published.DirectTransmissionLoss[3],
 		Published.DirectTransmissionLoss[4], Published.DirectTransmissionLoss[5],
-		Published.DirectLowpassCutoffHz);
+		Published.DirectLowpassCutoffHz,
+		Published.ArrivalDirection.X, Published.ArrivalDirection.Y, Published.ArrivalDirection.Z,
+		OffAxisDeg, Published.ArrivalFocus);
 }
 
 

@@ -19,6 +19,20 @@ public:
 	{
 		float DirectTransmissionLoss[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f }; // 0 = audible, 1 = blocked
 		float DirectLowpassCutoffHz = 20000.f;
+
+		// Where the sound is heard from. World space, unit length: the energy-weighted average of
+		// the arrival directions of every path that reached the listener, blended with the
+		// transmitted part along the direct line using the same weights as the level.
+		FVector ArrivalDirection = FVector::ForwardVector;
+
+		// ArrivalDirection placed at the true source distance, for a proxy emitter. The distance
+		// is kept true because the longer path's loss is already in DirectTransmissionLoss.
+		FVector VirtualPosition = FVector::ZeroVector;
+
+		// Length of the averaged direction vector, 0..1. Near 1: the energy arrives from one
+		// direction, e.g. a single doorway. Near 0: it arrives from everywhere. Drives spread.
+		float ArrivalFocus = 1.f;
+
 		bool  bHasValidEstimate = false;
 	};
 
@@ -52,6 +66,11 @@ public:
 
 		float DirectTransmissionLoss[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
 		float DirectLowpassCutoffHz = 20000.f;
+
+		// Smoothed arrival vector, not a unit direction. Its length is the focus, so smoothing the
+		// vector lets disagreeing arrivals shorten it instead of making the direction flip.
+		FVector SmoothedArrival = FVector::ZeroVector;
+
 		bool  bHasValidEstimate = false;
 
 		float AirAbsorptionMinDistance = 300.f;
@@ -97,6 +116,13 @@ public:
 
 	struct FLossAccumulator { float Bands[RTA::NumBands] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f }; };
 
+	/** Sum of ArrivingEnergy * FirstSegmentDirection, and of ArrivingEnergy, over connecting paths. */
+	struct FArrivalAccumulator
+	{
+		FVector Sum = FVector::ZeroVector;
+		float   Energy = 0.f;
+	};
+
 	struct FSurfaceAcoustics
 	{
 		float Reflected[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
@@ -127,13 +153,18 @@ public:
 
 private:
 	bool TickAudioTrace(float DeltaTime);
+
+	/** Draws each source's true and apparent direction. Game thread only; see rta.DebugDrawArrival. */
+	void DrawArrivalDebug() const;
 	void RunAudioTrace(const TArray<uint32>& SourceIds, uint32 TraceSeed);
 	bool GatherDirectData(const FVector& ListenerPos, const TArray<uint32>& SourceIds,
 	                      TArray<FValidData>& OutValidData) const;
 	void BounceRaysTrace(const FVector& ListenerPos, const TArray<FValidData>& ValidData,
-	                     uint32 TraceSeed, TArray<FLossAccumulator>& TotalLoss) const;
-	void TraceWriteBack(const TArray<FValidData>& ValidData,
-	                    const TArray<FLossAccumulator>& TotalLoss, int32 SrcIdx) const;
+	                     uint32 TraceSeed, TArray<FLossAccumulator>& TotalLoss,
+	                     TArray<FArrivalAccumulator>& TotalArrival) const;
+	void TraceWriteBack(const FVector& ListenerPos, const TArray<FValidData>& ValidData,
+	                    const TArray<FLossAccumulator>& TotalLoss,
+	                    const TArray<FArrivalAccumulator>& TotalArrival, int32 SrcIdx) const;
 
 	bool TickRoomProbe(float DeltaTime);
 	void RunRoomProbe(uint32 TraceSeed);
