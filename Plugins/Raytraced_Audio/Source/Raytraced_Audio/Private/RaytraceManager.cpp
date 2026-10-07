@@ -44,16 +44,12 @@ namespace
 
 	constexpr float ShadowRouletteMinP = 0.05f;
 
-	// --- Shoebox validation -------------------------------------------------------------
-	// Describe a sealed rectangular room with one uniform material, and every probe prints
-	// the analytic predictions next to what the tracer measured.
 	static int32 GRTAShoebox = 0;
 	static FAutoConsoleVariableRef CVarRTAShoebox(
 		TEXT("rta.Shoebox"), GRTAShoebox,
 		TEXT("1 = print a validation report against analytic predictions every probe."),
 		ECVF_Default);
 
-	// Inner dimensions in metres: the air volume, not the outer edges of the wall actors.
 	static float GRTAShoeboxX = 2.f;
 	static float GRTAShoeboxY = 2.f;
 	static float GRTAShoeboxZ = 2.f;
@@ -67,18 +63,10 @@ namespace
 	static FAutoConsoleVariableRef CVarRTAShoeboxAlpha(TEXT("rta.Shoebox.Alpha"), GRTAShoeboxAlpha,
 		TEXT("Uniform absorption of every shoebox surface."), ECVF_Default);
 
-	// Tolerances. MFP is expected to read slightly low: each ray's first segment runs from
-	// the listener, an interior point, so it is shorter than a wall-to-wall chord.
 	constexpr double ShoeboxMfpTolerancePct = 2.0;
 	constexpr double ShoeboxT30TolerancePct = 10.0;
 	constexpr float  ShoeboxAlphaTolerance  = 0.005f;
 
-	// Ray energy below which the room probe starts Russian roulette. Above it every ray
-	// survives, so the echogram tail is fully sampled down to this level. Roulette from a
-	// fixed depth kept surviving rays proportional to energy, which is right for total
-	// energy but left a 2 m shoebox with 23 samples between 100 and 150 ms and none after,
-	// so the tail ended at a random bin and T30 could not be measured.
-	// Must sit well below the -35 dB T30 needs: -50 dB leaves the truncation detector room.
 	static int32 GRTADebugDrawArrival = 0;
 	static FAutoConsoleVariableRef CVarRTADebugDrawArrival(
 		TEXT("rta.DebugDrawArrival"), GRTADebugDrawArrival,
@@ -300,14 +288,9 @@ void FRaytraceManager::DrawArrivalDebug() const
 		ListenerPos = Listener->Position;
 	}
 
-	// The listener usually sits at the camera, where a line starting exactly at the eye is hard
-	// to see. Start slightly below it.
 	const FVector Origin = ListenerPos - FVector(0.f, 0.f, 15.f);
-
-	// One trace tick plus a margin, so lines refresh without flickering or piling up.
 	const float LifeTime = AudioTraceTickInterval * 1.5f;
 
-	// Snapshot under the lock, draw after it, so the results lock is held only briefly.
 	TArray<TPair<FVector, FSourceResult>> Snapshot;
 	{
 		FReadScopeLock Lock(ResultsLock);
@@ -335,20 +318,16 @@ void FRaytraceManager::DrawArrivalDebug() const
 	{
 		const FVector& EmitterPos = Item.Key;
 		const FSourceResult& Result = Item.Value;
-
-		// Recomputed from the current listener instead of using Result.VirtualPosition, which was
-		// placed from wherever the listener stood when the trace ran.
 		const float Distance = FVector::Dist(ListenerPos, EmitterPos);
 		const FVector Apparent = Origin + Result.ArrivalDirection * Distance;
 
-		// Where the source really is: thin red.
+		// Where the source really is
 		DrawDebugLine(DrawWorld, Origin, EmitterPos, FColor::Red, false, LifeTime, 0, 1.f);
 
-		// Where it is heard from: thick green.
+		// Where it is heard from
 		DrawDebugLine(DrawWorld, Origin, Apparent, FColor::Green, false, LifeTime, 0, 3.f);
 
-		// Sphere sized by spread: small when the energy arrives from one direction, large when it
-		// arrives from everywhere.
+		// Sphere sized by spread
 		const float Radius = FMath::Lerp(10.f, 80.f, 1.f - Result.ArrivalFocus);
 		DrawDebugSphere(DrawWorld, Apparent, Radius, 12, FColor::Green, false, LifeTime, 0, 1.f);
 
@@ -361,8 +340,6 @@ void FRaytraceManager::DrawArrivalDebug() const
 
 bool FRaytraceManager::TickAudioTrace(float /*DeltaTime*/)
 {
-	// Before the in-flight early-out, so it draws every tick. The core ticker runs on the game
-	// thread, which is where debug drawing has to happen.
 	DrawArrivalDebug();
 
 	bool bExpected = false;
@@ -378,7 +355,7 @@ bool FRaytraceManager::TickAudioTrace(float /*DeltaTime*/)
 		FWriteScopeLock Lock(Listener->Lock);
 		bListenerReady = Listener->bPositionSet;
 		bListenerDirty = Listener->bDirty;
-		//Listener->bDirty = false;
+		Listener->bDirty = false;
 	}
 
 	TArray<uint32> SourceIdsToTrace;
@@ -392,7 +369,7 @@ bool FRaytraceManager::TickAudioTrace(float /*DeltaTime*/)
 				&& Result.Value->bEmitterPositionSet
 				&& !Result.Value->bTraceInFlight)
 			{
-				//Result.Value->bDirty = false;
+				Result.Value->bDirty = false;
 				Result.Value->bTraceInFlight = true;
 				SourceIdsToTrace.Add(Result.Key);
 			}
@@ -620,8 +597,8 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 	struct FNeeContext
 	{
 		TArray<FLossAccumulator> Loss;
-		TArray<FVector> ArrivalSum;       // sum of ArrivingEnergy * FirstDir, per source
-		TArray<float>   ArrivalEnergy;    // sum of ArrivingEnergy, per source
+		TArray<FVector> ArrivalSum;
+		TArray<float>   ArrivalEnergy;
 		TArray<bool>    Connected;
 		bool            bInitialised = false;
 	};
@@ -663,11 +640,6 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 				}
 
 				const FRayPath& Path = Paths[RayNum];
-
-				// By reciprocity, a ray leaving the listener in direction d carries sound arriving
-				// from d, whichever later bounce made the connection. A path that goes ceiling ->
-				// wall -> source is heard from the ceiling, not from the wall, so the first
-				// segment is the arrival direction for every path this ray completes.
 				const FVector FirstDir = Path.Num() > 0
 					? (Path[0].Point - ListenerPos).GetSafeNormal()
 					: FVector::ZeroVector;
@@ -694,10 +666,6 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 							MeanArriving += ArrivingEnergy;
 						}
 						MeanArriving /= float(RTA::NumBands);
-
-						// Weighted by what the path delivered, not by its loss: a path that brings
-						// more sound should pull the direction harder. Sums, not a running average,
-						// so the result is independent of thread scheduling and merges exactly.
 						Ctx.ArrivalSum[SrcIdx]    += FirstDir * MeanArriving;
 						Ctx.ArrivalEnergy[SrcIdx] += MeanArriving;
 
@@ -775,19 +743,12 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 	const TSharedPtr<FSourceRayData>& RayData = Data.SourceData;
 
 	FSourceResult Published;
-
-	// --- Arrival direction, computed outside the lock -------------------------------------
-	// Same weights as the level below, so direction and loudness agree about where the energy
-	// comes from. The transmitted part travels straight through the wall along the direct line;
-	// the indirect part arrives along the energy-weighted mean of the paths' first segments.
 	const FVector ToSource = Data.EmitterPos - ListenerPos;
 	const float SourceDistanceCm = ToSource.Size();
 	const FVector DirToSource = SourceDistanceCm > KINDA_SMALL_NUMBER
 		? ToSource / SourceDistanceCm
 		: FVector::ForwardVector;
 
-	// With clear line of sight DirectTransmissionEnergy keeps its default of 1, so the direct
-	// weight is 1, the indirect weight is 0 and the source is heard from where it is.
 	float MeanTransmission = 0.f;
 	for (int32 Band = 0; Band < RTA::NumBands; ++Band)
 	{
@@ -796,22 +757,16 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 	MeanTransmission = FMath::Clamp(MeanTransmission / float(RTA::NumBands), 0.f, 1.f);
 
 	const FArrivalAccumulator& Arrival = TotalArrival[SrcIdx];
-
-	// Arrival.Energy / RayCount is the band-average of the indirect energy the level formula
-	// uses, since unconnected rays contribute nothing to either.
+	
 	const float IndirectFraction = Arrival.Energy / float(RayCount);
 	const float DirectWeight   = MeanTransmission;
 	const float IndirectWeight = (1.f - MeanTransmission) * IndirectFraction;
 	const float TotalWeight    = DirectWeight + IndirectWeight;
-
-	// Mean indirect direction; its length is already 0..1.
+	
 	const FVector IndirectMean = Arrival.Energy > KINDA_SMALL_NUMBER
 		? Arrival.Sum / Arrival.Energy
 		: FVector::ZeroVector;
-
-	// Normalised by total weight so the length is the focus, on a scale that stays consistent
-	// from pass to pass. If nothing reaches the listener at all, the source is silent anyway and
-	// the direct line is as good a direction as any.
+	
 	const FVector RawArrival = TotalWeight > KINDA_SMALL_NUMBER
 		? (DirToSource * DirectWeight + IndirectMean * IndirectWeight) / TotalWeight
 		: DirToSource;
@@ -837,8 +792,6 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 			? FMath::Lerp(RayData->DirectLowpassCutoffHz, ValidData[SrcIdx].AirAbsorptionCutoffHz, OcclusionSmoothingAlpha)
 			: ValidData[SrcIdx].AirAbsorptionCutoffHz;
 
-		// Smooth the vector, not the unit direction. When successive passes disagree the vector
-		// shortens, which lowers the focus, instead of the direction snapping between openings.
 		RayData->SmoothedArrival = RayData->bHasValidEstimate
 			? FMath::Lerp(RayData->SmoothedArrival, RawArrival, OcclusionSmoothingAlpha)
 			: RawArrival;
@@ -857,7 +810,6 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 			: DirToSource;
 		Published.ArrivalFocus = FMath::Clamp(Focus, 0.f, 1.f);
 
-		// True distance, not path length: the longer path's loss is already in the level.
 		Published.VirtualPosition = ListenerPos + Published.ArrivalDirection * SourceDistanceCm;
 
 		Published.bHasValidEstimate = true;
@@ -865,7 +817,6 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 
 	RayData->Result.Write(Published);
 
-	// Off-axis angle: how far the heard direction has moved from the true one.
 	const float OffAxisDeg = FMath::RadiansToDegrees(FMath::Acos(
 		FMath::Clamp(FVector::DotProduct(Published.ArrivalDirection, DirToSource), -1.f, 1.f)));
 
@@ -961,7 +912,6 @@ void FRaytraceManager::RunRoomProbe(uint32 TraceSeed)
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(RTA_ProbeBounce);
 
-		// Read once so every worker uses the same threshold for the whole probe.
 		const float RouletteEnergy = FMath::Max(GRTAProbeRouletteEnergy, KINDA_SMALL_NUMBER);
 
 		ParallelForWithTaskContext(BounceStats, RayCount,
@@ -1052,9 +1002,6 @@ void FRaytraceManager::RunRoomProbe(uint32 TraceSeed)
 					if (PeakEnergy < EnergyFloor)
 						break;
 
-					// Roulette relative to the tail level still needed, not from a fixed depth.
-					// Survival q = E / threshold, so a surviving ray renormalised by 1/q sits back
-					// at the threshold and the estimate stays unbiased.
 					if (PeakEnergy < RouletteEnergy)
 					{
 						const float q = FMath::Clamp(PeakEnergy / RouletteEnergy, RouletteQMin, RouletteQMax);
@@ -1245,7 +1192,6 @@ void FRaytraceManager::RunRoomProbe(uint32 TraceSeed)
 
 	FRoomResult Published;
 
-	// Outside the lock scope so the shoebox report can read them after publishing.
 	TStaticArray<FDecayMetric, RTA::NumBands> DecayMetrics;
 	int32 ProbeCountSnapshot = 0;
 
@@ -1350,12 +1296,9 @@ void FRaytraceManager::LogShoeboxReport(const FRoomResult& Published,
 	};
 	auto Verdict = [](bool bPass) { return bPass ? TEXT("PASS") : TEXT("FAIL"); };
 
-	// 1. Sealed: any escape means a gap between the walls.
 	const double EscapedPct = double(Published.EscapedRayFraction) * 100.0;
 	const bool bSealed = Published.EscapedRayFraction <= 0.f;
 
-	// 2. Material: every band should read the uniform alpha exactly. A value of 0.10 here
-	// means the physical material is not resolving and the default is being used.
 	float MaxAlphaErr = 0.f;
 	for (int32 Band = 0; Band < RTA::NumBands; ++Band)
 	{
@@ -1363,7 +1306,6 @@ void FRaytraceManager::LogShoeboxReport(const FRoomResult& Published,
 	}
 	const bool bMaterial = MaxAlphaErr < ShoeboxAlphaTolerance;
 
-	// 3. Mean free path against 4V/S: geometry and direction sampling only.
 	const double MfpErr = Pct(Published.MeanFreePathMetres, MfpRef);
 	const bool bMfp = FMath::Abs(MfpErr) <= ShoeboxMfpTolerancePct;
 
@@ -1375,8 +1317,6 @@ void FRaytraceManager::LogShoeboxReport(const FRoomResult& Published,
 	UE_LOG(LogRTA, Log, TEXT("  3 MFP        %.4f m  vs 4V/S %.4f m  (%+.2f%%)             %s"),
 		Published.MeanFreePathMetres, MfpRef, MfpErr, Verdict(bMfp));
 
-	// 4 and 5, per band. "traced" is Eyring from the traced MFP and mean absorption;
-	// "T30" is the Schroeder fit to the accumulated echogram.
 	UE_LOG(LogRTA, Log, TEXT("  4/5    band   analytic    traced (err)        T30 (err)         |R|   curv   win"));
 
 	for (int32 Band = 0; Band < RTA::NumBands; ++Band)
