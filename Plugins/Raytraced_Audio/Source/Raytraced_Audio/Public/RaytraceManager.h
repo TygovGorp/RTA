@@ -23,12 +23,9 @@ public:
 		FVector ArrivalDirection = FVector::ForwardVector;
 		FVector VirtualPosition = FVector::ZeroVector;
 		float ArrivalFocus = 1.f;
-
-		// Diffraction (debug / inspection only)
 		FVector DetourPoint = FVector::ZeroVector;
 		float DetourExcessCm = 0.f;
 		bool  bHasDetour = false;
-
 		bool  bHasValidEstimate = false;
 	};
 
@@ -40,7 +37,6 @@ public:
 		float MeasuredT20[RTA::NumBands] = {};
 		bool  bT30Valid[RTA::NumBands] = {};
 		bool  bT20Valid[RTA::NumBands] = {};
-
 		float EyringRT60[RTA::NumBands] = {};
 		float MeanAbsorption[RTA::NumBands] = {};
 		float MeanFreePathMetres = 0.f;
@@ -57,21 +53,13 @@ public:
 		
 		FVector EmitterPosition = FVector::ZeroVector;
 		bool bEmitterPositionSet = false;
-
-		// Set once the virtual source plugin reports this source's position. From then on the
-		// engine's emitter position is the moved (virtual) one, so ProcessAudio's is ignored.
 		bool bTruePositionOverridden = false;
 		bool bDirty = true;
 		bool bTraceInFlight = false;
-
 		float DirectTransmissionLoss[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
 		float DirectLowpassCutoffHz = 20000.f;
-
-
 		FVector SmoothedArrival = FVector::ZeroVector;
-
 		bool  bHasValidEstimate = false;
-
 		float AirAbsorptionMinDistance = 300.f;
 		float AirAbsorptionMaxDistance = 5000.f;
 		float AirAbsorptionCutoffAtMinDistance = 20000.f;
@@ -87,12 +75,9 @@ public:
 		FVector Position = FVector::ZeroVector;
 		bool bPositionSet = false;
 		bool bDirty = true;
-
 		FEchogram FreshEchogram;
 		FEchogram AccumulatedEchogram;
-
 		int32 ProbeCount = 0;
-
 		float EyringRT60[RTA::NumBands] = {};
 		float MeanAbsorption[RTA::NumBands] = {};
 		float MeanFreePathMetres = 0.f;
@@ -110,8 +95,6 @@ public:
 		FVector EmitterPos = FVector::ZeroVector;
 		bool bDirectLOS = false;
 		float DirectTransmissionEnergy[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
-
-		// Energy that bends around the blocking obstacle, relative to an open path
 		float DirectDiffractionEnergy[RTA::NumBands] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
 		FVector DetourPoint = FVector::ZeroVector;
 		float DetourExcessCm = 0.f;
@@ -123,7 +106,7 @@ public:
 	struct FDetour
 	{
 		FVector Point = FVector::ZeroVector;
-		float ExcessCm = TNumericLimits<float>::Max();   // path excess over the straight line
+		float ExcessCm = TNumericLimits<float>::Max();
 		bool bFound = false;
 	};
 
@@ -152,15 +135,11 @@ public:
 		float AirAbsorptionCutoffAtMaxDistance = 2000.f);
 	void UnregisterSource(uint32 SourceId);
 
-	void UpdateEmitterPosition(uint32 SourceId, const FVector& Position);
+	void UpdateEmitterPosition(uint32 SourceId, const FVector& Position) const;
+	
+	bool UpdateTrueEmitterPosition(uint32 SourceId, const FVector& Position) const;
 
-	/**
-	 * Real emitter position, reported by the virtual source plugin before it moves the sound.
-	 * Returns false if the source isn't registered (occlusion off for this sound, or not started yet).
-	 */
-	bool UpdateTrueEmitterPosition(uint32 SourceId, const FVector& Position);
-
-	void UpdateListenerPosition(const FVector& Position);
+	void UpdateListenerPosition(const FVector& Position) const;
 
 	FSourceResult GetLatestResults(uint32 SourceId) const;
 	FRoomResult   GetLatestRoomResult() const;
@@ -183,15 +162,15 @@ private:
 	void BounceRaysTrace(const FVector& ListenerPos, const TArray<FValidData>& ValidData,
 	                     uint32 TraceSeed, TArray<FLossAccumulator>& TotalLoss,
 	                     TArray<FArrivalAccumulator>& TotalArrival) const;
-	void TraceWriteBack(const FVector& ListenerPos, const TArray<FValidData>& ValidData,
-	                    const TArray<FLossAccumulator>& TotalLoss,
-	                    const TArray<FArrivalAccumulator>& TotalArrival, int32 SrcIdx) const;
+	static void TraceWriteBack(const FVector& ListenerPos, const TArray<FValidData>& ValidData,
+	                           const TArray<FLossAccumulator>& TotalLoss,
+	                           const TArray<FArrivalAccumulator>& TotalArrival, int32 SrcIdx);
 
 	bool TickRoomProbe(float DeltaTime);
 	void RunRoomProbe(uint32 TraceSeed);
 
-	void LogShoeboxReport(const FRoomResult& Published,
-		const TStaticArray<FDecayMetric, RTA::NumBands>& DecayMetrics, int32 ProbeCount) const;
+	static void LogShoeboxReport(const FRoomResult& Published,
+	                             const TStaticArray<FDecayMetric, RTA::NumBands>& DecayMetrics, int32 ProbeCount);
 	static void ComputeEyringRT60(float MeanFreePathMetres,
 	                              const float MeanAbsorption[RTA::NumBands],
 	                              float OutRT60[RTA::NumBands]);
@@ -212,7 +191,7 @@ private:
 	static constexpr float AudioTraceTickInterval = 0.033f;
 	static constexpr float RoomProbeTickInterval  = 0.25f;
 	static constexpr float MinPositionDeltaForDirty = 5.f;
-	static constexpr float ClusterSizeCm = 300.f;   // 3 m
+	static constexpr float ClusterSizeCm = 300.f;
 
 	static constexpr int32 RayCount = 1028;
 	static constexpr int32 OcclusionMaxDepth = 8;
@@ -226,8 +205,8 @@ private:
 	static constexpr float OcclusionSmoothingAlpha = 0.15f;
 	
 	static constexpr float OcclusionRayLengthHeadroom = 2.0f;
-	static constexpr float MinOcclusionRayLengthCm = 1000.f;    //  10 m
-	static constexpr float MaxOcclusionRayLengthCm = 20000.f;   // 200 m
+	static constexpr float MinOcclusionRayLengthCm = 1000.f;
+	static constexpr float MaxOcclusionRayLengthCm = 20000.f;
 
 	std::atomic<bool> bAudioTraceRunning{ false };
 	std::atomic<bool> bRoomProbeRunning{ false };
