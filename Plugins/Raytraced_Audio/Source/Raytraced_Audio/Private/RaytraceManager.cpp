@@ -173,20 +173,41 @@ void FRaytraceManager::UnregisterSource(uint32 SourceId)
 	Results.Remove(SourceId);
 }
 
+void FRaytraceManager::ApplyEmitterPositionLocked(FSourceRayData& RayData, const FVector& Position)
+{
+	const bool bFirstSet = !RayData.bEmitterPositionSet;
+	if (bFirstSet ||
+		FVector::DistSquared(RayData.EmitterPosition, Position) > FMath::Square(MinPositionDeltaForDirty))
+	{
+		RayData.EmitterPosition = Position;
+		RayData.bEmitterPositionSet = true;
+		RayData.bDirty = true;
+	}
+}
+
 void FRaytraceManager::UpdateEmitterPosition(uint32 SourceId, const FVector& Position)
 {
 	TSharedPtr<FSourceRayData> RayData = FindSourceRayData(SourceId);
 	if (!RayData.IsValid()) return;
 
 	FWriteScopeLock Lock(RayData->Lock);
-	const bool bFirstSet = !RayData->bEmitterPositionSet;
-	if (bFirstSet ||
-		FVector::DistSquared(RayData->EmitterPosition, Position) > FMath::Square(MinPositionDeltaForDirty))
-	{
-		RayData->EmitterPosition = Position;
-		RayData->bEmitterPositionSet = true;
-		RayData->bDirty = true;
-	}
+
+	// Once the virtual source plugin moves this sound, the engine reports the virtual position.
+	// Tracing from there would see the corner as open, so only the true position counts.
+	if (RayData->bTruePositionOverridden) return;
+
+	ApplyEmitterPositionLocked(*RayData, Position);
+}
+
+bool FRaytraceManager::UpdateTrueEmitterPosition(uint32 SourceId, const FVector& Position)
+{
+	TSharedPtr<FSourceRayData> RayData = FindSourceRayData(SourceId);
+	if (!RayData.IsValid()) return false;
+
+	FWriteScopeLock Lock(RayData->Lock);
+	RayData->bTruePositionOverridden = true;
+	ApplyEmitterPositionLocked(*RayData, Position);
+	return true;
 }
 
 void FRaytraceManager::UpdateListenerPosition(const FVector& Position)

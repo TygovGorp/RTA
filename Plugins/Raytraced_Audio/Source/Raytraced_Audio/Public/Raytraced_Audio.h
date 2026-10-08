@@ -6,6 +6,7 @@
 #include "OcclusionFactory.h"
 #include "RaytraceManager.h"
 #include "ReverbFactory.h"
+#include "SourceDataOverrideFactory.h"
 
 class FRaytracedAudioModule : public IModuleInterface
 {
@@ -21,6 +22,7 @@ private:
 	TSharedPtr<FAudioPluginListener> AudioPluginListener;
 	FRaytracedOcclusionFactory OcclusionFactory;
 	FRaytracedReverbFactory ReverbFactory;
+	FRaytracedSourceDataOverrideFactory SourceDataOverrideFactory;
 
 	TUniquePtr<FAutoConsoleCommand> DumpEchogramCommand;
 	TUniquePtr<FAutoConsoleCommand> TestFDNCommand;

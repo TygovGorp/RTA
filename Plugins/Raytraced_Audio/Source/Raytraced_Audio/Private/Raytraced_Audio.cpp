@@ -20,10 +20,14 @@ void FRaytracedAudioModule::StartupModule()
 	ReverbFactory.SetRTManagerMapPtr(&RTManagerMap);
 	ReverbFactory.SetAudioPluginListenerPtr(AudioPluginListener);
 
+	SourceDataOverrideFactory.SetRTManagerMapPtr(&RTManagerMap);
+
 	IModularFeatures::Get().RegisterModularFeature(
 		IAudioOcclusionFactory::GetModularFeatureName(), &OcclusionFactory);
 	IModularFeatures::Get().RegisterModularFeature(
 		IAudioReverbFactory::GetModularFeatureName(), &ReverbFactory);
+	IModularFeatures::Get().RegisterModularFeature(
+		IAudioSourceDataOverrideFactory::GetModularFeatureName(), &SourceDataOverrideFactory);
 
 	DumpEchogramCommand = MakeUnique<FAutoConsoleCommand>(
 		TEXT("rta.DumpEchogram"),
@@ -90,6 +94,13 @@ void FRaytracedAudioModule::StartupModule()
 
 void FRaytracedAudioModule::ShutdownModule()
 {
+	IModularFeatures::Get().UnregisterModularFeature(
+		IAudioOcclusionFactory::GetModularFeatureName(), &OcclusionFactory);
+	IModularFeatures::Get().UnregisterModularFeature(
+		IAudioReverbFactory::GetModularFeatureName(), &ReverbFactory);
+	IModularFeatures::Get().UnregisterModularFeature(
+		IAudioSourceDataOverrideFactory::GetModularFeatureName(), &SourceDataOverrideFactory);
+
 	DumpEchogramCommand.Reset();
 	TestFDNCommand.Reset();
 }

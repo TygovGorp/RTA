@@ -3,6 +3,7 @@
 #include "AssetTypeCategories.h"
 #include "RTAOcclusionSourceSettings.h"
 #include "RTAReverbSourceSettings.h"
+#include "RTASourceDataOverrideSettings.h"
 
 URTAOcclusionSourceSettingsFactory::URTAOcclusionSourceSettingsFactory()
 {
@@ -38,6 +39,25 @@ UObject* URTAReverbSourceSettingsFactory::FactoryCreateNew(
 }
 
 uint32 URTAReverbSourceSettingsFactory::GetMenuCategories() const
+{
+	return EAssetTypeCategories::Sounds;
+}
+
+URTASourceDataOverrideSettingsFactory::URTASourceDataOverrideSettingsFactory()
+{
+	SupportedClass = URTASourceDataOverrideSettings::StaticClass();
+	bCreateNew = true;
+	bEditAfterNew = true;
+}
+
+UObject* URTASourceDataOverrideSettingsFactory::FactoryCreateNew(
+	UClass* InClass, UObject* InParent, FName InName, EObjectFlags Flags,
+	UObject* /*Context*/, FFeedbackContext* /*Warn*/)
+{
+	return NewObject<URTASourceDataOverrideSettings>(InParent, InName, Flags);
+}
+
+uint32 URTASourceDataOverrideSettingsFactory::GetMenuCategories() const
 {
 	return EAssetTypeCategories::Sounds;
 }

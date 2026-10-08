@@ -28,6 +28,9 @@ void FRaytracedOcclusion::OnInitSource(const uint32 SourceId, const FName& /*Aud
 		RTManager->RegisterSource(SourceId);
 	}
 
+	// The virtual source plugin logs the same line; matching IDs confirm both plugins see the same voice.
+	UE_LOG(LogRTA, Verbose, TEXT("Occlusion OnInitSource id=%u"), SourceId);
+
 	FWriteScopeLock Lock(FilterStatesLock);
 	FilterStates.Add(SourceId, FOcclusionFilterState());
 }
@@ -43,6 +46,8 @@ void FRaytracedOcclusion::OnReleaseSource(const uint32 SourceId)
 void FRaytracedOcclusion::ProcessAudio(const FAudioPluginSourceInputData& InputData,
 	FAudioPluginSourceOutputData& OutputData)
 {
+	// Ignored by the manager for sources the virtual source plugin moves: there the engine's
+	// emitter position is the virtual one, and the true position comes from that plugin.
 	RTManager->UpdateEmitterPosition(InputData.SourceId, InputData.SpatializationParams->EmitterWorldPosition);
 
 	RTManager->UpdateListenerPosition(InputData.SpatializationParams->ListenerPosition);

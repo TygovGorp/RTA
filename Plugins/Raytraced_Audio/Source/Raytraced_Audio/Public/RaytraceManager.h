@@ -57,6 +57,10 @@ public:
 		
 		FVector EmitterPosition = FVector::ZeroVector;
 		bool bEmitterPositionSet = false;
+
+		// Set once the virtual source plugin reports this source's position. From then on the
+		// engine's emitter position is the moved (virtual) one, so ProcessAudio's is ignored.
+		bool bTruePositionOverridden = false;
 		bool bDirty = true;
 		bool bTraceInFlight = false;
 
@@ -150,6 +154,12 @@ public:
 
 	void UpdateEmitterPosition(uint32 SourceId, const FVector& Position);
 
+	/**
+	 * Real emitter position, reported by the virtual source plugin before it moves the sound.
+	 * Returns false if the source isn't registered (occlusion off for this sound, or not started yet).
+	 */
+	bool UpdateTrueEmitterPosition(uint32 SourceId, const FVector& Position);
+
 	void UpdateListenerPosition(const FVector& Position);
 
 	FSourceResult GetLatestResults(uint32 SourceId) const;
@@ -187,6 +197,7 @@ private:
 	                              float OutRT60[RTA::NumBands]);
 
 	TSharedPtr<FSourceRayData> FindSourceRayData(uint32 SourceId) const;
+	static void ApplyEmitterPositionLocked(FSourceRayData& RayData, const FVector& Position);
 	bool IsWorldTraceable() const;
 	static FVector SampleBounceDirection(bool bHasHitSurface, const FVector& SegmentStart,
 	                                     const FVector& PreviousSegmentStart,
