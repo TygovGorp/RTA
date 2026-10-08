@@ -11,6 +11,7 @@
 
 class UAcousticMaterialAsset;
 class UWorld;
+struct FCollisionQueryParams;
 
 class FRaytraceManager : public TSharedFromThis<FRaytraceManager>
 {
@@ -22,6 +23,12 @@ public:
 		FVector ArrivalDirection = FVector::ForwardVector;
 		FVector VirtualPosition = FVector::ZeroVector;
 		float ArrivalFocus = 1.f;
+
+		// Diffraction (debug / inspection only)
+		FVector DetourPoint = FVector::ZeroVector;
+		float DetourExcessCm = 0.f;
+		bool  bHasDetour = false;
+
 		bool  bHasValidEstimate = false;
 	};
 
@@ -99,7 +106,21 @@ public:
 		FVector EmitterPos = FVector::ZeroVector;
 		bool bDirectLOS = false;
 		float DirectTransmissionEnergy[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
+
+		// Energy that bends around the blocking obstacle, relative to an open path
+		float DirectDiffractionEnergy[RTA::NumBands] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+		FVector DetourPoint = FVector::ZeroVector;
+		float DetourExcessCm = 0.f;
+		bool bHasDetour = false;
+
 		float AirAbsorptionCutoffHz = 20000.f;
+	};
+
+	struct FDetour
+	{
+		FVector Point = FVector::ZeroVector;
+		float ExcessCm = TNumericLimits<float>::Max();   // path excess over the straight line
+		bool bFound = false;
 	};
 
 	struct FLossAccumulator { float Bands[RTA::NumBands] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f }; };
@@ -142,9 +163,13 @@ private:
 	bool TickAudioTrace(float DeltaTime);
 
 	void DrawArrivalDebug() const;
+	void DrawVirtualPositionDebug() const;
 	void RunAudioTrace(const TArray<uint32>& SourceIds, uint32 TraceSeed);
 	bool GatherDirectData(const FVector& ListenerPos, const TArray<uint32>& SourceIds,
 	                      TArray<FValidData>& OutValidData) const;
+	FDetour FindDetour(const FVector& ListenerPos, const FVector& EmitterPos,
+	                   const FVector& BlockPoint, const FCollisionQueryParams& Params) const;
+	static float KnifeEdgeLossDb(float Nu);
 	void BounceRaysTrace(const FVector& ListenerPos, const TArray<FValidData>& ValidData,
 	                     uint32 TraceSeed, TArray<FLossAccumulator>& TotalLoss,
 	                     TArray<FArrivalAccumulator>& TotalArrival) const;
