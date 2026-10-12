@@ -81,21 +81,29 @@ void FRaytracedAudioModule::StartupModule()
 			R[n] = Out[1];
 		}
 
-		// Decay. Band 0 holds the combined energy, bands 1 and 2 each channel on its own, so a
-		// channel that decays differently from the other shows up as a different T30.
+	   	const float IRSeconds = NumSamples / SampleRate;
+	   	const int32 Stretch = FMath::Max(1, FMath::CeilToInt32(IRSeconds / FEchogram::MaxTimeSeconds));
+		const float EffectiveBinSeconds = FEchogram::BinWidthSeconds * Stretch;
+
 		FEchogram Echo;
 		for (int32 n = 0; n < NumSamples; ++n)
 		{
-			const int32 Bin = FMath::FloorToInt32((n / SampleRate) / FEchogram::BinWidthSeconds);
+			const int32 Bin = FMath::FloorToInt32((n / SampleRate) / EffectiveBinSeconds);
 			if (Bin >= FEchogram::NumBins) break;
 			Echo.At(0, Bin) += L[n] * L[n] + R[n] * R[n];
 			Echo.At(1, Bin) += L[n] * L[n];
 			Echo.At(2, Bin) += R[n] * R[n];
 		}
-		const FDecayMetric Both  = RTA::ComputeDecayMetrics(Echo, 0);
-		const FDecayMetric Left  = RTA::ComputeDecayMetrics(Echo, 1);
-		const FDecayMetric Right = RTA::ComputeDecayMetrics(Echo, 2);
-	   	
+		FDecayMetric Both  = RTA::ComputeDecayMetrics(Echo, 0);
+		FDecayMetric Left  = RTA::ComputeDecayMetrics(Echo, 1);
+		FDecayMetric Right = RTA::ComputeDecayMetrics(Echo, 2);
+		for (FDecayMetric* M : { &Both, &Left, &Right })
+		{
+			M->EDT *= Stretch;
+			M->T20 *= Stretch;
+			M->T30 *= Stretch;
+		}
+
 		auto Correlate = [&L, &R, NumSamples](int32 Begin, int32 End, double& OutRho, double& OutIacc)
 		{
 			Begin = FMath::Clamp(Begin, 0, NumSamples);

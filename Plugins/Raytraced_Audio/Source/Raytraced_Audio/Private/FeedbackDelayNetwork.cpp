@@ -1,4 +1,14 @@
 #include "FeedbackDelayNetwork.h"
+#include "HAL/IConsoleManager.h"
+
+namespace
+{
+	static float GRTAReverbModDepth = 0.012f;
+	static FAutoConsoleVariableRef CVarRTAReverbModDepth(
+		TEXT("rta.Reverb.ModDepth"), GRTAReverbModDepth,
+		TEXT("Delay modulation depth as a fraction of each line's length (0 = off, max 0.02). For A/B-ing ringing."),
+		ECVF_Default);
+}
 
 void FFeedbackDelayNetwork::Init(float InSampleRate)
 {
@@ -45,6 +55,22 @@ void FFeedbackDelayNetwork::SetRT60(float Seconds)
 void FFeedbackDelayNetwork::SetDamping(float Amount)
 {
 	TargetDamping = FMath::Clamp(Amount, 0.0f, 0.95f);
+
+	// One shared coefficient means the 911-sample line passes through the lowpass ~4x as often per second
+	// as the 3761-sample line, so it loses high frequencies ~4x faster. Mixing then can't make the poles
+	// decay together: the slowest few (long lines, high band) outlive the rest and the late tail turns
+	// into a handful of ringing tones. Same rule as the broadband gains: loss in dB proportional to length.
+	//
+	// The one-pole y = (1-d)x + d*y[-1] has unity DC gain and gain X = (1-d)/(1+d) at Nyquist. Keep
+	// ln(X) per sample constant: X_i = X_ref^(m_i / m_mean).
+	const float XRef = (1.f - TargetDamping) / (1.f + TargetDamping);
+	const float LogXPerSample = FMath::Loge(FMath::Max(XRef, KINDA_SMALL_NUMBER)) / FMath::Max(GetMeanDelaySeconds() * SampleRate, 1.f);
+
+	for (int32 i = 0; i < NumLines; ++i)
+	{
+		const float Xi = FMath::Exp(LogXPerSample * BaseDelaySamples[i]);
+		TargetLineDamping[i] = FMath::Clamp((1.f - Xi) / (1.f + Xi), 0.f, 0.99f);
+	}
 }
 
 void FFeedbackDelayNetwork::SetPredelaySeconds(float Seconds)
@@ -99,7 +125,7 @@ void FFeedbackDelayNetwork::Reset()
 		
 	}
 	Predelay.Reset();
-	Damping = TargetDamping;
+	for (int32 i = 0; i < NumLines; ++i) LineDamping[i] = TargetLineDamping[i];
 	ModTime = 0.f;
 }
 
@@ -138,7 +164,8 @@ TStaticArray<float, 2> FFeedbackDelayNetwork::ProcessSample(float In)
 	for (int32 i = 0; i < NumLines; ++i)
 	{
 		const float V = Tap[i] * Gain[i];
-		FilterZ1[i] = (1.f - Damping) * V + Damping * FilterZ1[i];
+		const float D = LineDamping[i];
+		FilterZ1[i] = (1.f - D) * V + D * FilterZ1[i];
 		Tap[i] = FilterZ1[i];
 	}
 
@@ -163,20 +190,32 @@ void FFeedbackDelayNetwork::ProcessBlock(const float* In, TStaticArray<float*, 2
 	{
 		GainStep[i] = (TargetGain[i] - Gain[i]) * InvFrames;
 	}
-	const float DampingStep = (TargetDamping - Damping) * InvFrames;
+	TStaticArray<float, NumLines> DampingStep;
+	for (int32 i = 0; i < NumLines; ++i)
+	{
+		DampingStep[i] = (TargetLineDamping[i] - LineDamping[i]) * InvFrames;
+	}
+
+	ModDepthFraction = FMath::Clamp(GRTAReverbModDepth, 0.f, MaxModDepthFraction);
 
 	for (int32 n = 0; n < NumFrames; ++n)
 	{
-		for (int32 i = 0; i < NumLines; ++i) Gain[i] += GainStep[i];
-		Damping += DampingStep;
+		for (int32 i = 0; i < NumLines; ++i)
+		{
+			Gain[i] += GainStep[i];
+			LineDamping[i] += DampingStep[i];
+		}
 
 		const TStaticArray<float, 2> Frame = ProcessSample(In[n]);
 		Out[0][n] = Frame[0];
 		Out[1][n] = Frame[1];
 	}
 
-	for (int32 i = 0; i < NumLines; ++i) Gain[i] = TargetGain[i];
-	Damping = TargetDamping;
+	for (int32 i = 0; i < NumLines; ++i)
+	{
+		Gain[i] = TargetGain[i];
+		LineDamping[i] = TargetLineDamping[i];
+	}
 }
 
 int32 FFeedbackDelayNetwork::NearestPrimeAtLeast(int32 Wanted)

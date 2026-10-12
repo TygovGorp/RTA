@@ -60,9 +60,11 @@ class FFeedbackDelayNetwork
 public:
 	void Init(float SampleRate);
 	void SetRT60(float Seconds);
+	/** High-frequency damping for a line of mean length (0 = none). Each line gets its own coefficient,
+	 *  scaled by its length, so every line loses high frequencies at the same rate per second. */
 	void SetDamping(float Amount);
 
-	/** Current damping target, as derived by SetDecayFromBands. */
+	/** Current damping target (mean-length reference), as derived by SetDecayFromBands. */
 	float GetDamping() const { return TargetDamping; }
 	void SetDecayFromBands(const float RT60PerBand[6]);
 
@@ -90,6 +92,7 @@ private:
 	FRTADelayLine Predelay;
 	int32 PredelaySamples = 0;
 	
-	float Damping = 0.f, TargetDamping = 0.f;
+	float TargetDamping = 0.f;   // mean-length reference, what GetDamping() reports
+	TStaticArray<float, NumLines> LineDamping, TargetLineDamping;
 	float SampleRate = 48000.f;
 };
