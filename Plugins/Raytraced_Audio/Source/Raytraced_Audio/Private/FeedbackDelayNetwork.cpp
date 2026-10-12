@@ -121,18 +121,19 @@ TStaticArray<float, 2> FFeedbackDelayNetwork::ProcessSample(float In)
 		const float D = BaseDelaySamples[i]
 			+ Depth * FMath::Sin(2.f * PI * ModRate[i] * ModTime + ModPhase[i]);
 
-		Tap[i] = Lines[i].ReadFractional(D);
+		Tap[i] = Lines[i].ReadAllpass(D);
 	}
-	
-	TStaticArray<float, 2> Sum = 0.f;
+
+	float SumL = 0.f, SumR = 0.f;
 	for (int32 i = 0; i < NumLines; ++i)
 	{
-		Sum[(i < 8) ? 0 : 1] += Tap[i];
+		SumL += Tap[i];
+		SumR += (i & 1) ? -Tap[i] : Tap[i];
 	}
 	TStaticArray<float, 2> Out;
-	const float Norm = 1.f / FMath::Sqrt(float(NumLines / 2));
-	Out[0] = Sum[0] * Norm;
-	Out[1] = Sum[1] * Norm;
+	const float Norm = 1.f / FMath::Sqrt(float(NumLines));
+	Out[0] = SumL * Norm;
+	Out[1] = SumR * Norm;
 
 	for (int32 i = 0; i < NumLines; ++i)
 	{
@@ -169,9 +170,9 @@ void FFeedbackDelayNetwork::ProcessBlock(const float* In, TStaticArray<float*, 2
 		for (int32 i = 0; i < NumLines; ++i) Gain[i] += GainStep[i];
 		Damping += DampingStep;
 
-		auto Temp = ProcessSample(In[n]);
-		Out[0][n] = Temp[0];
-		Out[1][n] = Temp[1];
+		const TStaticArray<float, 2> Frame = ProcessSample(In[n]);
+		Out[0][n] = Frame[0];
+		Out[1][n] = Frame[1];
 	}
 
 	for (int32 i = 0; i < NumLines; ++i) Gain[i] = TargetGain[i];

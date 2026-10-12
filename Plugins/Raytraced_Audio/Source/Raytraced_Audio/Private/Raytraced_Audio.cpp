@@ -2,6 +2,8 @@
 #include "Log.h"
 #include "RTADecayMetrics.h"
 #include "HAL/IConsoleManager.h"
+#include "Misc/Paths.h"
+#include "Misc/FileHelper.h"
 
 DEFINE_LOG_CATEGORY(LogRTA);
 
@@ -53,38 +55,97 @@ void FRaytracedAudioModule::StartupModule()
 	   FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& Args)
 	{
 		const float RT60 = Args.Num() > 0 ? FCString::Atof(*Args[0]) : 2.0f;
-		
-		auto FDN = FFeedbackDelayNetwork();
-		FDN.Init(48000.f);
+		constexpr float SampleRate = 48000.f;
+
+		FFeedbackDelayNetwork FDN;
+		FDN.Init(SampleRate);
 		FDN.SetRT60(RT60);
 		FDN.SetDamping(0);
 		FDN.Reset();
-		
-		auto NumSamples = ceil(RT60 * 2.f * 48000.f);
-		
-		TArray<float> Capture;
-		/*Capture.SetNumUninitialized(NumSamples);
-		Capture[0] = FDN.ProcessSample(1.0f);
 
-		for (int n = 1; n < NumSamples; ++n)
-			Capture[n] = FDN.ProcessSample(0.0f);*/
-		
-		auto Echo = FEchogram();
-		
-		for (int n = 0; n < NumSamples; ++n)
+		const int32 NumSamples = FMath::CeilToInt32(RT60 * 2.f * SampleRate);
+		if (NumSamples <= 0)
 		{
-			auto Bin = floor((n / 48000.f) / FEchogram::BinWidthSeconds);
-			if (Bin < FEchogram::NumBins)
-				Echo.At(0, Bin) += Capture[n] * Capture[n];
+			UE_LOG(LogRTA, Warning, TEXT("rta.TestFDN: RT60 must be positive"));
+			return;
 		}
-		
-		auto M = RTA::ComputeDecayMetrics(Echo, 0);
-		UE_LOG(LogRTA, Log, TEXT("asked %.2f  measured T30 %.2f  |R| %.3f  curvature %.1f%%  window ok %d"), RT60, M.T30, abs(M.T30_R), M.CurvaturePercent, M.bWindowSufficient);
-	   	
-	   	FString Csv = TEXT("Sample,Time,Amplitude\n");
+
+		// Impulse response, both channels.
+		TArray<float> L, R;
+		L.SetNumUninitialized(NumSamples);
+		R.SetNumUninitialized(NumSamples);
 		for (int32 n = 0; n < NumSamples; ++n)
 		{
-			Csv += FString::Printf(TEXT("%d,%.6f,%.8f\n"), n, n / 48000.f, Capture[n]);
+			const TStaticArray<float, 2> Out = FDN.ProcessSample(n == 0 ? 1.f : 0.f);
+			L[n] = Out[0];
+			R[n] = Out[1];
+		}
+
+		// Decay. Band 0 holds the combined energy, bands 1 and 2 each channel on its own, so a
+		// channel that decays differently from the other shows up as a different T30.
+		FEchogram Echo;
+		for (int32 n = 0; n < NumSamples; ++n)
+		{
+			const int32 Bin = FMath::FloorToInt32((n / SampleRate) / FEchogram::BinWidthSeconds);
+			if (Bin >= FEchogram::NumBins) break;
+			Echo.At(0, Bin) += L[n] * L[n] + R[n] * R[n];
+			Echo.At(1, Bin) += L[n] * L[n];
+			Echo.At(2, Bin) += R[n] * R[n];
+		}
+		const FDecayMetric Both  = RTA::ComputeDecayMetrics(Echo, 0);
+		const FDecayMetric Left  = RTA::ComputeDecayMetrics(Echo, 1);
+		const FDecayMetric Right = RTA::ComputeDecayMetrics(Echo, 2);
+	   	
+		auto Correlate = [&L, &R, NumSamples](int32 Begin, int32 End, double& OutRho, double& OutIacc)
+		{
+			Begin = FMath::Clamp(Begin, 0, NumSamples);
+			End = FMath::Clamp(End, Begin, NumSamples);
+
+			double EnergyL = 0.0, EnergyR = 0.0;
+			for (int32 n = Begin; n < End; ++n)
+			{
+				EnergyL += double(L[n]) * L[n];
+				EnergyR += double(R[n]) * R[n];
+			}
+
+			OutRho = 0.0;
+			OutIacc = 0.0;
+			const double Norm = FMath::Sqrt(EnergyL * EnergyR);
+			if (Norm <= 0.0) return;
+
+			const int32 MaxLag = FMath::RoundToInt32(0.001f * SampleRate);
+			for (int32 Lag = -MaxLag; Lag <= MaxLag; ++Lag)
+			{
+				double Cross = 0.0;
+				for (int32 n = Begin; n < End; ++n)
+				{
+					const int32 m = n + Lag;
+					if (m >= Begin && m < End)
+					{
+						Cross += double(L[n]) * R[m];
+					}
+				}
+				const double Rho = Cross / Norm;
+				if (Lag == 0) OutRho = Rho;
+				OutIacc = FMath::Max(OutIacc, FMath::Abs(Rho));
+			}
+		};
+
+		const int32 Split = FMath::Min(FMath::RoundToInt32(0.080f * SampleRate), NumSamples);
+		double RhoEarly, IaccEarly, RhoLate, IaccLate;
+		Correlate(0, Split, RhoEarly, IaccEarly);
+		Correlate(Split, NumSamples, RhoLate, IaccLate);
+
+		UE_LOG(LogRTA, Log, TEXT("rta.TestFDN asked %.2f s  T30 both %.2f  left %.2f  right %.2f  |R| %.3f  curvature %.1f%%  window ok %d"),
+			RT60, Both.T30, Left.T30, Right.T30, FMath::Abs(Both.T30_R), Both.CurvaturePercent, Both.bWindowSufficient ? 1 : 0);
+		UE_LOG(LogRTA, Log, TEXT("rta.TestFDN L/R  early (0-80 ms): rho %+.3f  IACC %.3f   late (80 ms+): rho %+.3f  IACC %.3f"),
+			RhoEarly, IaccEarly, RhoLate, IaccLate);
+
+		FString Csv = TEXT("Sample,Time,Left,Right\n");
+		Csv.Reserve(NumSamples * 40);
+		for (int32 n = 0; n < NumSamples; ++n)
+		{
+			Csv += FString::Printf(TEXT("%d,%.6f,%.8f,%.8f\n"), n, n / SampleRate, L[n], R[n]);
 		}
 		const FString Path = FPaths::ProjectSavedDir() / TEXT("RTA_FDN_IR.csv");
 		FFileHelper::SaveStringToFile(Csv, *Path);

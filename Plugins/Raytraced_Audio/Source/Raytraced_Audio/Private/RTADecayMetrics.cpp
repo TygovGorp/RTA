@@ -125,14 +125,24 @@ FDecayMetric ComputeDecayMetrics(const FEchogram& Echogram, int32 Band)
 	EDCToDB(Curve);   // in place: Curve is now dB
 
 	int32 LastValidBin = FEchogram::NumBins - 1;
-
+	
 	float RefSlope = 0.f, RefR = 0.f;
-	if (FitDecay(Curve, 0.f, -10.f, FEchogram::NumBins - 1, RefSlope, RefR))
+	if (FitDecay(Curve, -5.f, -25.f, FEchogram::NumBins - 1, RefSlope, RefR))
 	{
-		constexpr int32 WindowBins = 100;
-		constexpr float SteepnessLimit = 1.25f;
 
-		for (int32 Bin = WindowBins; Bin < FEchogram::NumBins; ++Bin)
+		constexpr float WindowDecayDb = 5.f;
+		constexpr float SteepnessLimit = 1.25f;           // ~1 dB truncation bias
+
+		const float WindowSeconds = FMath::Clamp(WindowDecayDb / FMath::Abs(RefSlope), 0.005f, 0.1f);
+		const int32 WindowBins = FMath::Max(5, FMath::RoundToInt(WindowSeconds / FEchogram::BinWidthSeconds));
+		
+		int32 StartBin = 0;
+		while (StartBin < FEchogram::NumBins && Curve[StartBin] > -5.f)
+		{
+			++StartBin;
+		}
+
+		for (int32 Bin = StartBin + WindowBins; Bin < FEchogram::NumBins; ++Bin)
 		{
 			const float A = Curve[Bin - WindowBins];
 			const float B = Curve[Bin];

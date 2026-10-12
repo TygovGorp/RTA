@@ -8,13 +8,16 @@ struct FRTADelayLine
 	TArray<float> Buffer;
 	int32 WriteIndex = 0;
 
+	// Previous output of the allpass interpolator in ReadAllpass.
+	float AllpassZ1 = 0.f;
+
 	void Init(int32 LengthSamples)
 	{
-		Buffer.SetNumZeroed(FMath::Max(LengthSamples, 1)); WriteIndex = 0;
+		Buffer.SetNumZeroed(FMath::Max(LengthSamples, 1)); WriteIndex = 0; AllpassZ1 = 0.f;
 	}
 	void Reset()
 	{
-		FMemory::Memzero(Buffer.GetData(), Buffer.Num() * sizeof(float)); WriteIndex = 0;
+		FMemory::Memzero(Buffer.GetData(), Buffer.Num() * sizeof(float)); WriteIndex = 0; AllpassZ1 = 0.f;
 	}
 	void Write(float In)
 	{
@@ -33,6 +36,22 @@ struct FRTADelayLine
 		const float Frac = Pos - FMath::FloorToFloat(Pos);
 
 		return FMath::Lerp(Buffer[i0], Buffer[i1], Frac);
+	}
+	
+	float ReadAllpass(float DelaySamples)
+	{
+		const int32 Len = Buffer.Num();
+
+		const int32 M = FMath::FloorToInt32(DelaySamples - 0.5f);
+		const float Frac = DelaySamples - float(M);
+		const float Eta = (1.f - Frac) / (1.f + Frac);
+		int32 i0 = (WriteIndex - M) % Len;
+		if (i0 < 0) i0 += Len;
+		const int32 i1 = (i0 == 0) ? Len - 1 : i0 - 1;
+
+		const float Y = Eta * Buffer[i0] + Buffer[i1] - Eta * AllpassZ1;
+		AllpassZ1 = Y;
+		return Y;
 	}
 };
 
