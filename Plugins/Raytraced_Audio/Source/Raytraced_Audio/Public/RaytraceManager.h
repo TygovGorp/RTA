@@ -23,9 +23,11 @@ public:
 		FVector ArrivalDirection = FVector::ForwardVector;
 		FVector VirtualPosition = FVector::ZeroVector;
 		float ArrivalFocus = 1.f;
-		FVector DetourPoint = FVector::ZeroVector;
-		float DetourExcessCm = 0.f;
-		bool  bHasDetour = false;
+		FVector CornerPoint = FVector::ZeroVector;
+		bool  bHasCorner = false;
+		uint8 ArrivalKind = 0;
+		FVector ArrivalAnchor = FVector::ZeroVector;
+		bool  bHasAnchor = false;
 		bool  bHasValidEstimate = false;
 	};
 
@@ -59,6 +61,11 @@ public:
 		float DirectTransmissionLoss[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
 		float DirectLowpassCutoffHz = 20000.f;
 		FVector SmoothedArrival = FVector::ZeroVector;
+		FVector SmoothedBlend = FVector::ZeroVector;
+		FVector LastWinnerDir = FVector::ZeroVector;
+		bool  bHasLastWinner = false;
+		FVector SmoothedAnchor = FVector::ZeroVector;
+		bool  bHasSmoothedAnchor = false;
 		bool  bHasValidEstimate = false;
 		float AirAbsorptionMinDistance = 300.f;
 		float AirAbsorptionMaxDistance = 5000.f;
@@ -95,19 +102,8 @@ public:
 		FVector EmitterPos = FVector::ZeroVector;
 		bool bDirectLOS = false;
 		float DirectTransmissionEnergy[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
-		float DirectDiffractionEnergy[RTA::NumBands] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
-		FVector DetourPoint = FVector::ZeroVector;
-		float DetourExcessCm = 0.f;
-		bool bHasDetour = false;
 
 		float AirAbsorptionCutoffHz = 20000.f;
-	};
-
-	struct FDetour
-	{
-		FVector Point = FVector::ZeroVector;
-		float ExcessCm = TNumericLimits<float>::Max();
-		bool bFound = false;
 	};
 
 	struct FLossAccumulator { float Bands[RTA::NumBands] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f }; };
@@ -116,6 +112,27 @@ public:
 	{
 		FVector Sum = FVector::ZeroVector;
 		float   Energy = 0.f;
+	};
+	
+	enum class EArrivalKind : uint8 { Direct, Through, Corner, Blend, Hold };
+
+	static constexpr int32 NumArrivalLobes = 27;
+
+	struct FCornerPath
+	{
+		TArray<FVector, TInlineAllocator<10>> Verts;
+		TArray<float,   TInlineAllocator<10>> CumLengthCm;
+		float LobeEnergy = 0.f;
+	};
+
+	struct FArrivalCandidate
+	{
+		EArrivalKind Kind = EArrivalKind::Corner;
+		FVector Direction = FVector::ForwardVector;
+		FVector Point = FVector::ZeroVector;
+		FVector Anchor = FVector::ZeroVector;
+		float LengthCm = 0.f;
+		float Weight = 0.f;
 	};
 
 	struct FSurfaceAcoustics
@@ -156,15 +173,19 @@ private:
 	void RunAudioTrace(const TArray<uint32>& SourceIds, uint32 TraceSeed);
 	bool GatherDirectData(const FVector& ListenerPos, const TArray<uint32>& SourceIds,
 	                      TArray<FValidData>& OutValidData) const;
-	FDetour FindDetour(const FVector& ListenerPos, const FVector& EmitterPos,
-	                   const FVector& BlockPoint, const FCollisionQueryParams& Params) const;
 	static float KnifeEdgeLossDb(float Nu);
 	void BounceRaysTrace(const FVector& ListenerPos, const TArray<FValidData>& ValidData,
 	                     uint32 TraceSeed, TArray<FLossAccumulator>& TotalLoss,
-	                     TArray<FArrivalAccumulator>& TotalArrival) const;
+	                     TArray<FArrivalAccumulator>& TotalArrival,
+	                     TArray<TArray<FCornerPath>>& OutCornerPaths) const;
+	void FindCorners(const FVector& ListenerPos, const TArray<TArray<FCornerPath>>& CornerPaths,
+	                 TArray<TArray<FArrivalCandidate>>& OutCandidates) const;
+	static int32 ArrivalLobeIndex(const FVector& Dir);
+	static void ApplyAnchor(FSourceResult& Result, const FVector& ListenerNow, const FVector& EmitterNow);
 	static void TraceWriteBack(const FVector& ListenerPos, const TArray<FValidData>& ValidData,
 	                           const TArray<FLossAccumulator>& TotalLoss,
-	                           const TArray<FArrivalAccumulator>& TotalArrival, int32 SrcIdx);
+	                           const TArray<FArrivalAccumulator>& TotalArrival,
+	                           const TArray<TArray<FArrivalCandidate>>& CornerCandidates, int32 SrcIdx);
 
 	bool TickRoomProbe(float DeltaTime);
 	void RunRoomProbe(uint32 TraceSeed);

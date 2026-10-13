@@ -55,14 +55,7 @@ void FFeedbackDelayNetwork::SetRT60(float Seconds)
 void FFeedbackDelayNetwork::SetDamping(float Amount)
 {
 	TargetDamping = FMath::Clamp(Amount, 0.0f, 0.95f);
-
-	// One shared coefficient means the 911-sample line passes through the lowpass ~4x as often per second
-	// as the 3761-sample line, so it loses high frequencies ~4x faster. Mixing then can't make the poles
-	// decay together: the slowest few (long lines, high band) outlive the rest and the late tail turns
-	// into a handful of ringing tones. Same rule as the broadband gains: loss in dB proportional to length.
-	//
-	// The one-pole y = (1-d)x + d*y[-1] has unity DC gain and gain X = (1-d)/(1+d) at Nyquist. Keep
-	// ln(X) per sample constant: X_i = X_ref^(m_i / m_mean).
+	
 	const float XRef = (1.f - TargetDamping) / (1.f + TargetDamping);
 	const float LogXPerSample = FMath::Loge(FMath::Max(XRef, KINDA_SMALL_NUMBER)) / FMath::Max(GetMeanDelaySeconds() * SampleRate, 1.f);
 

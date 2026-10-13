@@ -15,6 +15,7 @@
 #include "BatchedTracer.h"
 #include "HAL/IConsoleManager.h"
 #include "DrawDebugHelpers.h"
+#include "Components/PrimitiveComponent.h"
 
 namespace
 {
@@ -70,7 +71,8 @@ namespace
 	static int32 GRTADebugDrawArrival = 0;
 	static FAutoConsoleVariableRef CVarRTADebugDrawArrival(
 		TEXT("rta.DebugDrawArrival"), GRTADebugDrawArrival,
-		TEXT("Draw each source's true direction (red), apparent direction (green) and diffraction detour (yellow)."),
+		TEXT("Draw each source's true direction (red), apparent direction (green: thick up to the first wall, thin beyond it) ")
+		TEXT("and the corner the sound bends around (magenta)."),
 		ECVF_Default);
 
 	static int32 GRTADebugDrawVirtualPosition = 0;
@@ -88,14 +90,10 @@ namespace
 	static int32 GRTADiffraction = 1;
 	static FAutoConsoleVariableRef CVarRTADiffraction(
 		TEXT("rta.Diffraction"), GRTADiffraction,
-		TEXT("1 = knife-edge diffraction around the obstacle blocking the direct path. 0 = off."),
+		TEXT("1 = diffraction around the corner found on the bounce-ray routes adds to the level. 0 = off."),
 		ECVF_Default);
 
 	constexpr float SpeedOfSoundMps     = 343.f;
-	constexpr int32 DetourNumDirections = 8;
-	constexpr int32 DetourBisectSteps   = 3;
-	constexpr int32 DetourSlideSteps    = 5;  
-	constexpr float DetourRadiiCm[]     = { 10.f, 20.f, 40.f, 80.f, 160.f, 320.f, 640.f, 1280.f };
 
 	static int32 GRTAReflectionSpreading = 1;
 	static FAutoConsoleVariableRef CVarRTAReflectionSpreading(
@@ -111,13 +109,61 @@ namespace
 		TEXT("for direction (precedence effect); the level is unaffected. 0 = off."),
 		ECVF_Default);
 
-	/** Window length in metres for the current rta.PrecedenceMs, or 0 when the weighting is off. */
+	static int32 GRTAArrivalMode = 1;
+	static FAutoConsoleVariableRef CVarRTAArrivalMode(
+		TEXT("rta.ArrivalMode"), GRTAArrivalMode,
+		TEXT("0 = blend all arrival directions (old behaviour). ")
+		TEXT("1 = pick one route: the first arrival, unless a later route is much louder (precedence rule)."),
+		ECVF_Default);
+
+	static float GRTAPrecedenceDb = 12.f;
+	static FAutoConsoleVariableRef CVarRTAPrecedenceDb(
+		TEXT("rta.PrecedenceDb"), GRTAPrecedenceDb,
+		TEXT("ArrivalMode 1: a later route must be this many dB louder than the current pick to take over the direction."),
+		ECVF_Default);
+
+	static float GRTAPrecedenceHystDb = 3.f;
+	static FAutoConsoleVariableRef CVarRTAPrecedenceHystDb(
+		TEXT("rta.PrecedenceHystDb"), GRTAPrecedenceHystDb,
+		TEXT("ArrivalMode 1: bonus in dB for last update's route, so the direction doesn't flip between close routes."),
+		ECVF_Default);
+
+	static int32 GRTACornerCandidates = 4;
+	static FAutoConsoleVariableRef CVarRTACornerCandidates(
+		TEXT("rta.CornerCandidates"), GRTACornerCandidates,
+		TEXT("ArrivalMode 1: strongest arrival lobes per source whose shortest path is searched for its first corner."),
+		ECVF_Default);
+
+	static float GRTAArrivalFastAlpha = 0.6f;
+	static FAutoConsoleVariableRef CVarRTAArrivalFastAlpha(
+		TEXT("rta.ArrivalFastAlpha"), GRTAArrivalFastAlpha,
+		TEXT("ArrivalMode 1: direction smoothing per update for noise-free routes (direct, through) and when the ")
+		TEXT("route switches. Corner routes keep the normal smoothing, which hides their noise."),
+		ECVF_Default);
+
+	constexpr int32 MaxTransmissionLayers = 4;
+	constexpr int32 CornerBisectSteps  = 8; 
+	constexpr float CandidateMergeDeg  = 5.f; 
+	constexpr float HysteresisMatchDeg = 10.f;
+
+	const TCHAR* ArrivalKindName(uint8 Kind)
+	{
+		switch (static_cast<FRaytraceManager::EArrivalKind>(Kind))
+		{
+		case FRaytraceManager::EArrivalKind::Direct:  return TEXT("direct");
+		case FRaytraceManager::EArrivalKind::Through: return TEXT("through");
+		case FRaytraceManager::EArrivalKind::Corner:  return TEXT("corner");
+		case FRaytraceManager::EArrivalKind::Blend:   return TEXT("blend");
+		case FRaytraceManager::EArrivalKind::Hold:    return TEXT("hold");
+		default:                                      return TEXT("?");
+		}
+	}
+
 	float PrecedenceWindowMetres()
 	{
 		return GRTAPrecedenceMs > 0.f ? SpeedOfSoundMps * GRTAPrecedenceMs * 0.001f : 0.f;
 	}
-
-	/** Direction weight for a route arriving ExtraPathMetres later than the straight line would. */
+	
 	float PrecedenceWeight(float ExtraPathMetres, float WindowMetres)
 	{
 		if (WindowMetres <= 0.f) return 1.f;
@@ -228,9 +274,41 @@ FRaytraceManager::FSourceResult FRaytraceManager::GetLatestResults(uint32 Source
 	TSharedPtr<FSourceRayData> RayData = FindSourceRayData(SourceId);
 	if (RayData.IsValid())
 	{
-		RayData->Result.TryRead(Out); 
+		if (RayData->Result.TryRead(Out) && Out.bHasAnchor)
+		{
+			FVector EmitterNow;
+			bool bEmitterSet;
+			{
+				FReadScopeLock Lock(RayData->Lock);
+				EmitterNow = RayData->EmitterPosition;
+				bEmitterSet = RayData->bEmitterPositionSet;
+			}
+
+			FVector ListenerNow = FVector::ZeroVector;
+			bool bListenerSet = false;
+			if (Listener.IsValid())
+			{
+				FReadScopeLock Lock(Listener->Lock);
+				ListenerNow = Listener->Position;
+				bListenerSet = Listener->bPositionSet;
+			}
+
+			if (bEmitterSet && bListenerSet)
+			{
+				ApplyAnchor(Out, ListenerNow, EmitterNow);
+			}
+		}
 	}
 	return Out;
+}
+
+void FRaytraceManager::ApplyAnchor(FSourceResult& Result, const FVector& ListenerNow, const FVector& EmitterNow)
+{
+	const FVector ToAnchor = Result.ArrivalAnchor - ListenerNow;
+	if (ToAnchor.SizeSquared() < 1.0) return;
+
+	Result.ArrivalDirection = ToAnchor.GetUnsafeNormal();
+	Result.VirtualPosition = ListenerNow + Result.ArrivalDirection * FVector::Dist(ListenerNow, EmitterNow);
 }
 
 FRaytraceManager::FRoomResult FRaytraceManager::GetLatestRoomResult() const
@@ -370,6 +448,7 @@ void FRaytraceManager::DrawArrivalDebug() const
 
 			FSourceResult Result;
 			if (!Entry.Value->Result.TryRead(Result) || !Result.bHasValidEstimate) continue;
+			if (Result.bHasAnchor) ApplyAnchor(Result, ListenerPos, EmitterPos);
 
 			Snapshot.Emplace(EmitterPos, Result);
 		}
@@ -381,31 +460,38 @@ void FRaytraceManager::DrawArrivalDebug() const
 		const FSourceResult& Result = Item.Value;
 		const float Distance = FVector::Dist(ListenerPos, EmitterPos);
 		const FVector Apparent = Origin + Result.ArrivalDirection * Distance;
-
-		// Where the source really is
+		
 		DrawDebugLine(DrawWorld, Origin, EmitterPos, FColor::Red, false, LifeTime, 0, 1.f);
+		
+		{
+			FCollisionQueryParams DebugParams;
+			DebugParams.bTraceComplex = true;
+			FHitResult DebugHit;
+			const bool bHitWall = DrawWorld->LineTraceSingleByChannel(DebugHit, Origin, Apparent, ECC_Visibility, DebugParams);
+			const FVector VisibleEnd = bHitWall ? FVector(DebugHit.ImpactPoint) : Apparent;
 
-		// Where it is heard from
-		DrawDebugLine(DrawWorld, Origin, Apparent, FColor::Green, false, LifeTime, 0, 3.f);
+			DrawDebugLine(DrawWorld, Origin, VisibleEnd, FColor::Green, false, LifeTime, 0, 3.f);
+			if (bHitWall)
+			{
+				DrawDebugLine(DrawWorld, VisibleEnd, Apparent, FColor(0, 120, 0), false, LifeTime, 0, 0.5f);
+			}
+		}
 
 		// Sphere sized by spread
 		const float Radius = FMath::Lerp(10.f, 80.f, 1.f - Result.ArrivalFocus);
 		DrawDebugSphere(DrawWorld, Apparent, Radius, 12, FColor::Green, false, LifeTime, 0, 1.f);
 
 		DrawDebugString(DrawWorld, Apparent + FVector(0.f, 0.f, Radius + 10.f),
-		                FString::Printf(TEXT("focus %.2f"), Result.ArrivalFocus),
+		                FString::Printf(TEXT("%s  focus %.2f"), ArrivalKindName(Result.ArrivalKind), Result.ArrivalFocus),
 		                nullptr, FColor::White, LifeTime);
 
-		// Shortest path around the blocking obstacle
-		if (Result.bHasDetour)
+		// First corner of the chosen ray route
+		if (Result.bHasCorner)
 		{
-			DrawDebugLine(DrawWorld, ListenerPos, Result.DetourPoint, FColor::Yellow, false, LifeTime, 0, 1.f);
-			DrawDebugLine(DrawWorld, Result.DetourPoint, EmitterPos, FColor::Yellow, false, LifeTime, 0, 1.f);
-			DrawDebugPoint(DrawWorld, Result.DetourPoint, 8.f, FColor::Yellow, false, LifeTime);
-			DrawDebugString(DrawWorld, Result.DetourPoint + FVector(0.f, 0.f, 15.f),
-			                FString::Printf(TEXT("excess %.0f cm"), Result.DetourExcessCm),
-			                nullptr, FColor::Yellow, LifeTime);
+			DrawDebugLine(DrawWorld, ListenerPos, Result.CornerPoint, FColor::Magenta, false, LifeTime, 0, 2.f);
+			DrawDebugPoint(DrawWorld, Result.CornerPoint, 10.f, FColor::Magenta, false, LifeTime);
 		}
+
 	}
 #endif
 }
@@ -417,6 +503,15 @@ void FRaytraceManager::DrawVirtualPositionDebug() const
 
 	UWorld* DrawWorld = World.Get();
 	if (!DrawWorld) return;
+
+	FVector ListenerNow = FVector::ZeroVector;
+	bool bListenerSet = false;
+	if (Listener.IsValid())
+	{
+		FReadScopeLock Lock(Listener->Lock);
+		ListenerNow = Listener->Position;
+		bListenerSet = Listener->bPositionSet;
+	}
 
 	constexpr float LifeTime = AudioTraceTickInterval * 1.5f;
 
@@ -443,6 +538,7 @@ void FRaytraceManager::DrawVirtualPositionDebug() const
 
 			FSourceResult Result;
 			if (!Entry.Value->Result.TryRead(Result) || !Result.bHasValidEstimate) continue;
+			if (Result.bHasAnchor && bListenerSet) ApplyAnchor(Result, ListenerNow, EmitterPos);
 
 			Items.Add({ .SourceId = Entry.Key, .EmitterPos = EmitterPos, .Result = Result });
 		}
@@ -466,7 +562,7 @@ void FRaytraceManager::DrawVirtualPositionDebug() const
 		DrawDebugString(DrawWorld, Virtual + FVector(0.f, 0.f, 45.f),
 		                FString::Printf(TEXT("src %u virtual\noffset %.0f cm  focus %.2f%s"),
 		                                Item.SourceId, OffsetCm, Item.Result.ArrivalFocus,
-		                                Item.Result.bHasDetour ? TEXT("  detour") : TEXT("")),
+		                                Item.Result.bHasCorner ? TEXT("  corner") : TEXT("")),
 		                nullptr, FColor::Cyan, LifeTime);
 	}
 #endif
@@ -510,11 +606,19 @@ void FRaytraceManager::RunAudioTrace(const TArray<uint32>& SourceIds, uint32 Tra
 	TArray<FArrivalAccumulator> TotalArrival;
 	TotalArrival.Init(FArrivalAccumulator(), ValidData.Num());
 
-	BounceRaysTrace(ListenerPos, ValidData, TraceSeed, TotalLoss, TotalArrival);
+	TArray<TArray<FCornerPath>> CornerPaths;
+	BounceRaysTrace(ListenerPos, ValidData, TraceSeed, TotalLoss, TotalArrival, CornerPaths);
+
+	TArray<TArray<FArrivalCandidate>> CornerCandidates;
+	CornerCandidates.SetNum(ValidData.Num());
+	if (GRTAArrivalMode != 0 || GRTADiffraction != 0)
+	{
+		FindCorners(ListenerPos, CornerPaths, CornerCandidates);
+	}
 
 	for (int32 SrcIdx = 0; SrcIdx < ValidData.Num(); ++SrcIdx)
 	{
-		TraceWriteBack(ListenerPos, ValidData, TotalLoss, TotalArrival, SrcIdx);
+		TraceWriteBack(ListenerPos, ValidData, TotalLoss, TotalArrival, CornerCandidates, SrcIdx);
 	}
 }
 
@@ -527,8 +631,6 @@ bool FRaytraceManager::GatherDirectData(const FVector& ListenerPos, const TArray
 	DirectTraceParams.bReturnPhysicalMaterial = true;
 	DirectTraceParams.bTraceComplex = true;
 
-	FCollisionQueryParams DetourTraceParams;
-	DetourTraceParams.bTraceComplex = true;
 
 	for (uint32 SourceId : SourceIds)
 	{
@@ -559,50 +661,58 @@ bool FRaytraceManager::GatherDirectData(const FVector& ListenerPos, const TArray
 
 		if (bBlocked)
 		{
-			const UAcousticPhysicalMaterial* PhysMat = Cast<UAcousticPhysicalMaterial>(DirectHit.PhysMaterial.Get());
-			const UAcousticMaterialAsset* Mat = PhysMat ? PhysMat->AcousticMaterial.Get() : nullptr;
-
-			if (Mat)
+			for (int32 Band = 0; Band < RTA::NumBands; ++Band)
 			{
-				TArrayView<const float> Transmission = Mat->GetTransmission();
-				for (int32 Band = 0; Band < RTA::NumBands; ++Band)
-				{
-					Entry.DirectTransmissionEnergy[Band] = FMath::Clamp(Transmission[Band], 0.f, 1.f);
-				}
-			}
-			else
-			{
-				for (int32 Band = 0; Band < RTA::NumBands; ++Band)
-				{
-					Entry.DirectTransmissionEnergy[Band] = RTA::DefaultTransmission;
-				}
+				Entry.DirectTransmissionEnergy[Band] = 1.f;
 			}
 
-			if (GRTADiffraction != 0)
+			FCollisionQueryParams LayerParams = DirectTraceParams;
+			FHitResult LayerHit = DirectHit;
+			for (int32 Layer = 1; ; ++Layer)
 			{
-				const FDetour Detour = FindDetour(ListenerPos, Entry.EmitterPos,
-				                                  DirectHit.ImpactPoint, DetourTraceParams);
-				if (Detour.bFound)
-				{
-					const float ExcessMetres = Detour.ExcessCm * RTA::CmToMetres;
-					const float DetourCm = Distance + Detour.ExcessCm;
-					
-					const float Spreading = DetourCm > KINDA_SMALL_NUMBER ? FMath::Square(Distance / DetourCm) : 1.f;
+				const UAcousticPhysicalMaterial* PhysMat = Cast<UAcousticPhysicalMaterial>(LayerHit.PhysMaterial.Get());
+				const UAcousticMaterialAsset* Mat = PhysMat ? PhysMat->AcousticMaterial.Get() : nullptr;
 
+				if (Mat)
+				{
+					TArrayView<const float> Transmission = Mat->GetTransmission();
 					for (int32 Band = 0; Band < RTA::NumBands; ++Band)
 					{
-						const float Lambda = SpeedOfSoundMps / RTA::FrequencyBands[Band];
-						const float Nu = 2.f * FMath::Sqrt(ExcessMetres / Lambda);
-						const float LossDb = KnifeEdgeLossDb(Nu);
-						Entry.DirectDiffractionEnergy[Band] =
-							FMath::Clamp(FMath::Pow(10.f, -LossDb / 10.f) * Spreading, 0.f, 1.f);
+						Entry.DirectTransmissionEnergy[Band] *= FMath::Clamp(Transmission[Band], 0.f, 1.f);
 					}
-
-					Entry.bHasDetour = true;
-					Entry.DetourPoint = Detour.Point;
-					Entry.DetourExcessCm = Detour.ExcessCm;
 				}
+				else
+				{
+					for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+					{
+						Entry.DirectTransmissionEnergy[Band] *= RTA::DefaultTransmission;
+					}
+				}
+
+				UPrimitiveComponent* HitComponent = LayerHit.GetComponent();
+				
+				if (!HitComponent) break;
+				
+				LayerParams.AddIgnoredComponent(HitComponent);
+
+				FHitResult NextHit;
+				if (!World->LineTraceSingleByChannel(NextHit, LayerHit.ImpactPoint, Entry.EmitterPos,
+				                                     ECC_Visibility, LayerParams))
+				{
+					break;
+				}
+
+				if (Layer >= MaxTransmissionLayers)
+				{
+					for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+					{
+						Entry.DirectTransmissionEnergy[Band] = 0.f;
+					}
+					break;
+				}
+				LayerHit = NextHit;
 			}
+
 		}
 
 		const float Alpha = FMath::Clamp((Distance - MinDist) / (MaxDist - MinDist), 0.f, 1.f);
@@ -614,162 +724,22 @@ bool FRaytraceManager::GatherDirectData(const FVector& ListenerPos, const TArray
 	return OutValidData.Num() > 0;
 }
 
-FRaytraceManager::FDetour FRaytraceManager::FindDetour(const FVector& ListenerPos, const FVector& EmitterPos,
-                                                       const FVector& BlockPoint, const FCollisionQueryParams& Params) const
-{
-	TRACE_CPUPROFILER_EVENT_SCOPE(RTA_FindDetour);
-
-	FDetour Best;
-
-	const FVector ToSource = EmitterPos - ListenerPos;
-	const float DirectCm = ToSource.Size();
-	if (DirectCm <= KINDA_SMALL_NUMBER) return Best;
-
-	const FVector Axis = ToSource / DirectCm;
-	const FVector Helper = FMath::Abs(Axis.Z) < 0.9f ? FVector::UpVector : FVector::ForwardVector;
-	const FVector U = FVector::CrossProduct(Axis, Helper).GetSafeNormal();
-	const FVector V = FVector::CrossProduct(Axis, U);
-
-	auto IsClear = [this, &ListenerPos, &EmitterPos, &Params](const FVector& P)
-	{
-		return !World->LineTraceTestByChannel(ListenerPos, P, ECC_Visibility, Params)
-			&& !World->LineTraceTestByChannel(EmitterPos, P, ECC_Visibility, Params);
-	};
-
-	auto ExcessOf = [&ListenerPos, &EmitterPos, DirectCm](const FVector& P)
-	{
-		return FMath::Max(FVector::Dist(ListenerPos, P) + FVector::Dist(P, EmitterPos) - DirectCm, 0.f);
-	};
-
-	auto DirectionFor = [&U, &V](int32 DirIdx)
-	{
-		const float Angle = 2.f * PI * static_cast<float>(DirIdx) / static_cast<float>(DetourNumDirections);
-		return U * FMath::Cos(Angle) + V * FMath::Sin(Angle);
-	};
-
-	auto RadialSearch = [&IsClear](const FVector& Center, const FVector& Dir, FVector& OutP)
-	{
-		float PrevRadius = 0.f;
-		for (const float Radius : DetourRadiiCm)
-		{
-			if (!IsClear(Center + Dir * Radius))
-			{
-				PrevRadius = Radius;
-				continue;
-			}
-
-			float Lo = PrevRadius;
-			float Hi = Radius;
-			for (int32 Step = 0; Step < DetourBisectSteps; ++Step)
-			{
-				const float Mid = 0.5f * (Lo + Hi);
-				if (IsClear(Center + Dir * Mid)) Hi = Mid;
-				else                             Lo = Mid;
-			}
-			OutP = Center + Dir * Hi;
-			return true;
-		}
-		return false;
-	};
-
-	auto Consider = [&Best, &ExcessOf](const FVector& P)
-	{
-		const float Excess = ExcessOf(P);
-		if (Excess < Best.ExcessCm)
-		{
-			Best.Point = P;
-			Best.ExcessCm = Excess;
-			Best.bFound = true;
-		}
-		return Excess;
-	};
-
-	const float TFront = FVector::DotProduct(BlockPoint - ListenerPos, Axis) / DirectCm;
-	float TBack = TFront;
-	{
-		FHitResult BackHit;
-		if (World->LineTraceSingleByChannel(BackHit, EmitterPos, ListenerPos, ECC_Visibility, Params))
-		{
-			TBack = FVector::DotProduct(BackHit.ImpactPoint - ListenerPos, Axis) / DirectCm;
-		}
-	}
-	const float TLo = FMath::Clamp(FMath::Min(TFront, TBack), 0.f, 1.f);
-	const float THi = FMath::Clamp(FMath::Max(TFront, TBack), 0.f, 1.f);
-
-	auto CenterAt = [&ListenerPos, &Axis, DirectCm](const float T)
-	{
-		return ListenerPos + Axis * (T * DirectCm);
-	};
-	
-	int32 BestDir = INDEX_NONE;
-	const float Phase1T[] = { TFront, 0.5f * (TLo + THi), TBack };
-	for (const float T : Phase1T)
-	{
-		const FVector Center = CenterAt(T);
-		for (int32 DirIdx = 0; DirIdx < DetourNumDirections; ++DirIdx)
-		{
-			FVector P;
-			if (RadialSearch(Center, DirectionFor(DirIdx), P))
-			{
-				const float Before = Best.ExcessCm;
-				if (Consider(P) < Before) BestDir = DirIdx;
-			}
-		}
-		if (Best.bFound) break;
-	}
-
-	if (!Best.bFound) return Best;
-	
-	if ((THi - TLo) * DirectCm > 1.f)
-	{
-		const FVector Dir = DirectionFor(BestDir);
-		auto Evaluate = [&](float T)
-		{
-			FVector P;
-			return RadialSearch(CenterAt(T), Dir, P) ? Consider(P) : TNumericLimits<float>::Max();
-		};
-
-		constexpr float InvPhi = 0.618034f;
-		float A = TLo, B = THi;
-		float C = B - InvPhi * (B - A);
-		float D = A + InvPhi * (B - A);
-		float FC = Evaluate(C);
-		float FD = Evaluate(D);
-
-		for (int32 Iter = 0; Iter < DetourSlideSteps; ++Iter)
-		{
-			if (FC < FD)
-			{
-				B = D;  D = C;  FD = FC;
-				C = B - InvPhi * (B - A);
-				FC = Evaluate(C);
-			}
-			else
-			{
-				A = C;  C = D;  FC = FD;
-				D = A + InvPhi * (B - A);
-				FD = Evaluate(D);
-			}
-		}
-	}
-
-	return Best;
-}
-
 float FRaytraceManager::KnifeEdgeLossDb(float Nu)
 {
-	// ITU-R P.526 single knife-edge approximation, valid for Nu > about -0.78
 	if (Nu <= -0.78f) return 0.f;
 	const float X = Nu - 0.1f;
 	return 6.9f + 20.f * FMath::LogX(10.f, FMath::Sqrt(X * X + 1.f) + X);
 }
 
 void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<FValidData>& ValidData,
-                                       uint32 TraceSeed, TArray<FLossAccumulator>& TotalLoss, TArray<FArrivalAccumulator>& TotalArrival) const
+                                       uint32 TraceSeed, TArray<FLossAccumulator>& TotalLoss, TArray<FArrivalAccumulator>& TotalArrival,
+                                       TArray<TArray<FCornerPath>>& OutCornerPaths) const
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(RTA_BounceRays);
 
 	const int32 NumSources = ValidData.Num();
+	OutCornerPaths.Reset();
+	OutCornerPaths.SetNum(NumSources);
 	if (NumSources == 0) return;
 
 	float FurthestSourceCm = 0.f;
@@ -847,6 +817,14 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 			}
 		}, EParallelForFlags::BackgroundPriority);
 	}
+	
+	struct FLobeBest
+	{
+		float Energy = 0.f;
+		float LengthCm = TNumericLimits<float>::Max();
+		int32 RayNum = INDEX_NONE;
+		int32 BounceIdx = INDEX_NONE;
+	};
 
 	struct FNeeContext
 	{
@@ -854,6 +832,7 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 		TArray<FVector> ArrivalSum;
 		TArray<float>   ArrivalEnergy;
 		TArray<bool>    Connected;
+		TArray<FLobeBest> Lobes;
 		bool            bInitialised = false;
 	};
 
@@ -896,6 +875,7 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 				                           Ctx.ArrivalSum.Init(FVector::ZeroVector, NumSources);
 				                           Ctx.ArrivalEnergy.Init(0.f, NumSources);
 				                           Ctx.Connected.SetNumUninitialized(NumSources);
+				                           Ctx.Lobes.Init(FLobeBest(), NumSources * NumArrivalLobes);
 				                           Ctx.bInitialised = true;
 			                           }
 
@@ -908,9 +888,11 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 			                           const FVector FirstDir = Path.Num() > 0
 				                                                    ? (Path[0].Point - ListenerPos).GetSafeNormal()
 				                                                    : FVector::ZeroVector;
+			                           const int32 FirstLobe = Path.Num() > 0 ? ArrivalLobeIndex(FirstDir) : INDEX_NONE;
 
-			                           for (const FBounce& Bounce : Path)
+			                           for (int32 BounceIdx = 0; BounceIdx < Path.Num(); ++BounceIdx)
 			                           {
+				                           const FBounce& Bounce = Path[BounceIdx];
 				                           for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
 				                           {
 					                           if (Ctx.Connected[SrcIdx])
@@ -941,6 +923,18 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 						                           (TotalPathCm - StraightCm[SrcIdx]) * RTA::CmToMetres, PrecedenceMetres);
 					                           Ctx.ArrivalSum[SrcIdx]    += FirstDir * MeanArriving * Precedence;
 					                           Ctx.ArrivalEnergy[SrcIdx] += MeanArriving * Precedence;
+				                           	
+					                           if (FirstLobe != INDEX_NONE)
+					                           {
+						                           FLobeBest& Lobe = Ctx.Lobes[SrcIdx * NumArrivalLobes + FirstLobe];
+						                           Lobe.Energy += MeanArriving;
+						                           if (TotalPathCm < Lobe.LengthCm)
+						                           {
+							                           Lobe.LengthCm  = TotalPathCm;
+							                           Lobe.RayNum    = RayNum;
+							                           Lobe.BounceIdx = BounceIdx;
+						                           }
+					                           }
 
 					                           Ctx.Connected[SrcIdx] = true;
 				                           }
@@ -973,6 +967,63 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 
 			TotalArrival[SrcIdx].Sum    += Ctx.ArrivalSum[SrcIdx];
 			TotalArrival[SrcIdx].Energy += Ctx.ArrivalEnergy[SrcIdx];
+		}
+	}
+	
+	if (GRTAArrivalMode != 0 || GRTADiffraction != 0)
+	{
+		TArray<FLobeBest> Merged;
+		Merged.Init(FLobeBest(), NumSources * NumArrivalLobes);
+		for (const FNeeContext& Ctx : Contexts)
+		{
+			if (!Ctx.bInitialised) continue;
+			for (int32 i = 0; i < Merged.Num(); ++i)
+			{
+				const FLobeBest& In = Ctx.Lobes[i];
+				FLobeBest& Out = Merged[i];
+				Out.Energy += In.Energy;
+				if (In.RayNum != INDEX_NONE && In.LengthCm < Out.LengthCm)
+				{
+					Out.LengthCm  = In.LengthCm;
+					Out.RayNum    = In.RayNum;
+					Out.BounceIdx = In.BounceIdx;
+				}
+			}
+		}
+
+		const int32 MaxCandidates = FMath::Clamp(GRTACornerCandidates, 0, NumArrivalLobes);
+		for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
+		{
+			if (ValidData[SrcIdx].bDirectLOS || MaxCandidates == 0) continue;
+
+			TArray<int32, TInlineAllocator<NumArrivalLobes>> LobeOrder;
+			for (int32 Lobe = 0; Lobe < NumArrivalLobes; ++Lobe)
+			{
+				const FLobeBest& L = Merged[SrcIdx * NumArrivalLobes + Lobe];
+				if (L.RayNum != INDEX_NONE && L.Energy > 0.f) LobeOrder.Add(Lobe);
+			}
+			LobeOrder.Sort([&Merged, SrcIdx](int32 A, int32 B)
+			{
+				return Merged[SrcIdx * NumArrivalLobes + A].Energy > Merged[SrcIdx * NumArrivalLobes + B].Energy;
+			});
+
+			for (int32 i = 0; i < FMath::Min(MaxCandidates, LobeOrder.Num()); ++i)
+			{
+				const FLobeBest& L = Merged[SrcIdx * NumArrivalLobes + LobeOrder[i]];
+				const FRayPath& Path = Paths[L.RayNum];
+
+				FCornerPath& Corner = OutCornerPaths[SrcIdx].AddDefaulted_GetRef();
+				Corner.Verts.Add(ListenerPos);
+				Corner.CumLengthCm.Add(0.f);
+				for (int32 b = 0; b <= L.BounceIdx; ++b)
+				{
+					Corner.Verts.Add(Path[b].Point);
+					Corner.CumLengthCm.Add(Path[b].PathLengthCm);
+				}
+				Corner.Verts.Add(ValidData[SrcIdx].EmitterPos);
+				Corner.CumLengthCm.Add(L.LengthCm);
+				Corner.LobeEnergy = L.Energy;
+			}
 		}
 	}
 
@@ -1008,9 +1059,134 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 	}
 }
 
+int32 FRaytraceManager::ArrivalLobeIndex(const FVector& Dir)
+{
+	static constexpr float Split = 0.3827f;
+	auto Q = [](double C) { return C > Split ? 2 : (C < -Split ? 0 : 1); };
+	return Q(Dir.X) * 9 + Q(Dir.Y) * 3 + Q(Dir.Z);
+}
+
+void FRaytraceManager::FindCorners(const FVector& ListenerPos, const TArray<TArray<FCornerPath>>& CornerPaths,
+                                   TArray<TArray<FArrivalCandidate>>& OutCandidates) const
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(RTA_FindCorners);
+
+	struct FJob { int32 SrcIdx; int32 PathIdx; };
+	TArray<FJob> Jobs;
+	for (int32 SrcIdx = 0; SrcIdx < CornerPaths.Num(); ++SrcIdx)
+	{
+		for (int32 PathIdx = 0; PathIdx < CornerPaths[SrcIdx].Num(); ++PathIdx)
+		{
+			Jobs.Add({ SrcIdx, PathIdx });
+		}
+	}
+	if (Jobs.Num() == 0) return;
+
+	TArray<FArrivalCandidate> JobResults;
+	JobResults.SetNum(Jobs.Num());
+	TArray<uint8> JobValid;
+	JobValid.Init(0, Jobs.Num());
+	TArray<FVector> JobBlocked;
+	JobBlocked.SetNum(Jobs.Num());
+	TArray<uint8> JobBisected;
+	JobBisected.Init(0, Jobs.Num());
+
+	{
+		const FRTABatchedTracer Tracer(World.Get(), /*bTraceComplex*/ false);
+
+		auto IsBlocked = [this, &Tracer](const FVector& A, const FVector& B)
+		{
+			return Tracer.IsValid()
+				       ? Tracer.TraceTest(A, B)
+				       : World->LineTraceTestByChannel(A, B, ECC_Visibility);
+		};
+
+		ParallelFor(Jobs.Num(), [&](int32 JobIdx)
+		{
+			const FCornerPath& Path = CornerPaths[Jobs[JobIdx].SrcIdx][Jobs[JobIdx].PathIdx];
+			const int32 Last = Path.Verts.Num() - 1;
+			if (Last < 2) return;
+
+			int32 K = 1;
+			for (int32 i = 2; i <= Last; ++i)
+			{
+				if (!IsBlocked(ListenerPos, Path.Verts[i])) K = i;
+			}
+
+			FArrivalCandidate& Out = JobResults[JobIdx];
+			Out.Kind = EArrivalKind::Corner;
+			Out.Weight = Path.LobeEnergy;
+
+			if (K == Last)
+			{
+				Out.Point = Path.Verts[Last];
+				Out.LengthCm = FVector::Dist(ListenerPos, Out.Point);
+			}
+			else
+			{
+				FVector Lo = Path.Verts[K];
+				FVector Hi = Path.Verts[K + 1];
+				for (int32 Step = 0; Step < CornerBisectSteps; ++Step)
+				{
+					const FVector Mid = (Lo + Hi) * 0.5;
+					if (!IsBlocked(ListenerPos, Mid)) Lo = Mid;
+					else                              Hi = Mid;
+				}
+				
+				const FVector& Emitter = Path.Verts[Last];
+				const double DistListener = FVector::Dist2D(ListenerPos, Lo);
+				const double DistEmitter  = FVector::Dist2D(Lo, Emitter);
+				if (DistListener + DistEmitter > 1.0)
+				{
+					FVector Levelled = Lo;
+					Levelled.Z = FMath::Lerp(ListenerPos.Z, Emitter.Z, DistListener / (DistListener + DistEmitter));
+					if (!IsBlocked(ListenerPos, Levelled)) Lo = Levelled;
+				}
+				Out.Point = Lo;
+				JobBlocked[JobIdx] = Hi;
+				JobBisected[JobIdx] = 1;
+				
+				Out.LengthCm = FVector::Dist(ListenerPos, Lo)
+				             + FVector::Dist(Lo, Path.Verts[K + 1])
+				             + (Path.CumLengthCm[Last] - Path.CumLengthCm[K + 1]);
+			}
+
+			const FVector ToPoint = Out.Point - ListenerPos;
+			if (ToPoint.SizeSquared() < 1.f) return;
+			Out.Direction = ToPoint.GetSafeNormal();
+			JobValid[JobIdx] = 1;
+		}, EParallelForFlags::BackgroundPriority);
+	}   // lock released
+	
+	FCollisionQueryParams AnchorParams;
+	AnchorParams.bTraceComplex = true;
+	constexpr double MinAnchorDistanceCm = 100.0;
+
+	for (int32 JobIdx = 0; JobIdx < Jobs.Num(); ++JobIdx)
+	{
+		if (!JobValid[JobIdx]) continue;
+
+		FArrivalCandidate& Out = JobResults[JobIdx];
+		Out.Anchor = Out.Point;
+
+		if (JobBisected[JobIdx])
+		{
+			FHitResult EdgeHit;
+			if (World->LineTraceSingleByChannel(EdgeHit, ListenerPos, JobBlocked[JobIdx], ECC_Visibility, AnchorParams))
+			{
+				const double MaxT = FVector::Dist(ListenerPos, Out.Point);
+				const double T = FVector::DotProduct(FVector(EdgeHit.ImpactPoint) - ListenerPos, Out.Direction);
+				Out.Anchor = ListenerPos + Out.Direction * FMath::Clamp(T, FMath::Min(MinAnchorDistanceCm, MaxT), MaxT);
+			}
+		}
+
+		OutCandidates[Jobs[JobIdx].SrcIdx].Add(Out);
+	}
+}
+
 void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<FValidData>& ValidData,
                                       const TArray<FLossAccumulator>& TotalLoss, const TArray<FArrivalAccumulator>& TotalArrival,
-                                      const int32 SrcIdx)
+                                      const TArray<TArray<FArrivalCandidate>>& CornerCandidates, const int32 SrcIdx)
 {
 	const FValidData& Data = ValidData[SrcIdx];
 	const TSharedPtr<FSourceRayData>& RayData = Data.SourceData;
@@ -1021,28 +1197,73 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 	const FVector DirToSource = SourceDistanceCm > KINDA_SMALL_NUMBER
 		                            ? ToSource / SourceDistanceCm
 		                            : FVector::ForwardVector;
+	
+	auto CornerDiffractionBands = [&ListenerPos, &Data, SourceDistanceCm](const FVector& Corner, float* OutEnergy)
+	{
+		const float PathCm = FVector::Dist(ListenerPos, Corner) + FVector::Dist(Corner, Data.EmitterPos);
+		const float ExcessCm = FMath::Max(PathCm - SourceDistanceCm, 0.f);
+		const float ExcessMetres = ExcessCm * RTA::CmToMetres;
+		const float Spreading = PathCm > KINDA_SMALL_NUMBER ? FMath::Square(SourceDistanceCm / PathCm) : 1.f;
+		for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+		{
+			const float Lambda = SpeedOfSoundMps / RTA::FrequencyBands[Band];
+			const float Nu = 2.f * FMath::Sqrt(ExcessMetres / Lambda);
+			OutEnergy[Band] = FMath::Clamp(FMath::Pow(10.f, -KnifeEdgeLossDb(Nu) / 10.f) * Spreading, 0.f, 1.f);
+		}
+		return ExcessCm;
+	};
+	auto MeanOfBands = [](const float* Energy)
+	{
+		float Mean = 0.f;
+		for (int32 Band = 0; Band < RTA::NumBands; ++Band) Mean += Energy[Band];
+		return Mean / static_cast<float>(RTA::NumBands);
+	};
+	auto IsRealCorner = [&Data](const FArrivalCandidate& C)
+	{
+		return FVector::DistSquared(C.Point, Data.EmitterPos) > 1.0;
+	};
+
+	float DiffractionEnergy[RTA::NumBands] = {};
+	const FArrivalCandidate* DiffractionCorner = nullptr;
+	float DiffractionExcessCm = 0.f;
+	if (!Data.bDirectLOS && GRTADiffraction != 0)
+	{
+		float BestExcessCm = TNumericLimits<float>::Max();
+		for (const FArrivalCandidate& C : CornerCandidates[SrcIdx])
+		{
+			if (!IsRealCorner(C)) continue;
+			const float ExcessCm = FVector::Dist(ListenerPos, C.Anchor) + FVector::Dist(C.Anchor, Data.EmitterPos) - SourceDistanceCm;
+			if (ExcessCm < BestExcessCm)
+			{
+				BestExcessCm = ExcessCm;
+				DiffractionCorner = &C;
+			}
+		}
+		if (DiffractionCorner)
+		{
+			DiffractionExcessCm = CornerDiffractionBands(DiffractionCorner->Anchor, DiffractionEnergy);
+		}
+	}
 
 	float MeanTransmission = 0.f;
-	float MeanDiffraction = 0.f;
 	for (int32 Band = 0; Band < RTA::NumBands; ++Band)
 	{
 		MeanTransmission += Data.DirectTransmissionEnergy[Band];
-		MeanDiffraction  += Data.DirectDiffractionEnergy[Band];
 	}
 	MeanTransmission = FMath::Clamp(MeanTransmission / static_cast<float>(RTA::NumBands), 0.f, 1.f);
-	MeanDiffraction  = FMath::Clamp(MeanDiffraction  / static_cast<float>(RTA::NumBands), 0.f, 1.f);
+	const float MeanDiffraction = FMath::Clamp(MeanOfBands(DiffractionEnergy), 0.f, 1.f);
 	const float MeanDirect = FMath::Min(MeanTransmission + MeanDiffraction, 1.f);
 
-	const FVector DetourDir = Data.bHasDetour
-		                          ? (Data.DetourPoint - ListenerPos).GetSafeNormal()
+	const FVector AroundDir = DiffractionCorner
+		                          ? (DiffractionCorner->Anchor - ListenerPos).GetSafeNormal()
 		                          : DirToSource;
 
 	const FArrivalAccumulator& Arrival = TotalArrival[SrcIdx];
 	
 	const float IndirectFraction  = Arrival.Energy / static_cast<float>(RayCount);
 	const float DirectWeight      = MeanTransmission;
-	const float DiffractionWeight = Data.bHasDetour
-		                                ? MeanDiffraction * PrecedenceWeight(Data.DetourExcessCm * RTA::CmToMetres, PrecedenceWindowMetres())
+	const float DiffractionWeight = DiffractionCorner
+		                                ? MeanDiffraction * PrecedenceWeight(DiffractionExcessCm * RTA::CmToMetres, PrecedenceWindowMetres())
 		                                : 0.f;
 	const float IndirectWeight    = (1.f - MeanDirect) * IndirectFraction;
 	const float TotalWeight       = DirectWeight + DiffractionWeight + IndirectWeight;
@@ -1052,15 +1273,131 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 		                             : FVector::ZeroVector;
 	
 	const FVector RawArrival = TotalWeight > KINDA_SMALL_NUMBER
-		                           ? (DirToSource * DirectWeight + DetourDir * DiffractionWeight + IndirectMean * IndirectWeight) / TotalWeight
+		                           ? (DirToSource * DirectWeight + AroundDir * DiffractionWeight + IndirectMean * IndirectWeight) / TotalWeight
 		                           : DirToSource;
 
-	const float DetourAngleDeg = Data.bHasDetour
-		                             ? FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(FVector::DotProduct(RawArrival.GetSafeNormal(), DetourDir), -1.f, 1.f)))	
+	const float CornerAngleDeg = DiffractionCorner
+		                             ? FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(FVector::DotProduct(RawArrival.GetSafeNormal(), AroundDir), -1.f, 1.f)))
 		                             : -1.f;
 
-	UE_LOG(LogRTA, Verbose, TEXT("SourceId=%u W[through]=%.3f W[around]=%.3f W[reflect]=%.3f AngleToDetour=%.0fdeg"),
-	       Data.SourceId, DirectWeight, DiffractionWeight, IndirectWeight, DetourAngleDeg);
+	UE_LOG(LogRTA, Verbose, TEXT("SourceId=%u W[through]=%.3f W[around]=%.3f W[reflect]=%.3f AngleToCorner=%.0fdeg"),
+	       Data.SourceId, DirectWeight, DiffractionWeight, IndirectWeight, CornerAngleDeg);
+	
+	FArrivalCandidate Winner;
+	Winner.Kind = EArrivalKind::Blend;
+	Winner.Direction = RawArrival.GetSafeNormal(UE_SMALL_NUMBER, DirToSource);
+
+	if (GRTAArrivalMode != 0)
+	{
+		FVector LastWinnerDir = FVector::ZeroVector;
+		bool bHasLastWinner = false;
+		{
+			FReadScopeLock Lock(RayData->Lock);
+			LastWinnerDir = RayData->LastWinnerDir;
+			bHasLastWinner = RayData->bHasLastWinner;
+		}
+
+		if (Data.bDirectLOS)
+		{
+			Winner.Kind = EArrivalKind::Direct;
+			Winner.Direction = DirToSource;
+			Winner.Point = Data.EmitterPos;
+			Winner.Anchor = Data.EmitterPos;
+			Winner.LengthCm = SourceDistanceCm;
+			Winner.Weight = 1.f;
+		}
+		else
+		{
+			TArray<FArrivalCandidate, TInlineAllocator<8>> Candidates;
+
+			if (MeanTransmission > 0.f)
+			{
+				FArrivalCandidate& C = Candidates.AddDefaulted_GetRef();
+				C.Kind = EArrivalKind::Through;
+				C.Direction = DirToSource;
+				C.Point = Data.EmitterPos;
+				C.Anchor = Data.EmitterPos;
+				C.LengthCm = SourceDistanceCm;
+				C.Weight = MeanTransmission;
+			}
+
+			const float MergeCos = FMath::Cos(FMath::DegreesToRadians(CandidateMergeDeg));
+
+			const float IndirectScale = (1.f - MeanDirect) / static_cast<float>(RayCount);
+			for (const FArrivalCandidate& Corner : CornerCandidates[SrcIdx])
+			{
+				FArrivalCandidate C = Corner;
+				C.Weight *= IndirectScale;
+
+				if (GRTADiffraction != 0 && IsRealCorner(C))
+				{
+					float Bands[RTA::NumBands];
+					CornerDiffractionBands(C.Anchor, Bands);
+					C.Weight += MeanOfBands(Bands);
+				}
+
+				if (C.Weight > 0.f) Candidates.Add(C);
+			}
+
+			for (int32 i = 0; i < Candidates.Num(); ++i)
+			{
+				for (int32 j = Candidates.Num() - 1; j > i; --j)
+				{
+					FArrivalCandidate& A = Candidates[i];
+					const FArrivalCandidate& B = Candidates[j];
+					if (FVector::DotProduct(A.Direction, B.Direction) < MergeCos) continue;
+
+					const float MergedWeight = A.Weight + B.Weight;
+					if (B.LengthCm < A.LengthCm) A = B;
+					A.Weight = MergedWeight;
+					Candidates.RemoveAt(j);
+				}
+			}
+
+			Candidates.Sort([](const FArrivalCandidate& A, const FArrivalCandidate& B)
+			{
+				return A.LengthCm < B.LengthCm;
+			});
+
+			const float HystCos = FMath::Cos(FMath::DegreesToRadians(HysteresisMatchDeg));
+			auto ScoreDb = [&](const FArrivalCandidate& C)
+			{
+				float Db = 10.f * FMath::LogX(10.f, FMath::Max(C.Weight, 1.0e-12f));
+				if (bHasLastWinner && FVector::DotProduct(C.Direction, LastWinnerDir) > HystCos)
+				{
+					Db += GRTAPrecedenceHystDb;
+				}
+				return Db;
+			};
+
+			if (Candidates.Num() > 0)
+			{
+				int32 Pick = 0;
+				for (int32 i = 1; i < Candidates.Num(); ++i)
+				{
+					if (ScoreDb(Candidates[i]) > ScoreDb(Candidates[Pick]) + GRTAPrecedenceDb) Pick = i;
+				}
+				Winner = Candidates[Pick];
+			}
+			else
+			{
+				Winner.Kind = EArrivalKind::Hold;
+				Winner.Direction = bHasLastWinner ? LastWinnerDir : DirToSource;
+			}
+
+			if (UE_LOG_ACTIVE(LogRTA, Verbose))
+			{
+				FString List;
+				for (const FArrivalCandidate& C : Candidates)
+				{
+					List += FString::Printf(TEXT(" %s(%.0fcm %.1fdB)"), ArrivalKindName(static_cast<uint8>(C.Kind)),
+					                        C.LengthCm, 10.f * FMath::LogX(10.f, FMath::Max(C.Weight, 1.0e-12f)));
+				}
+				UE_LOG(LogRTA, Verbose, TEXT("SourceId=%u Routes:%s -> %s"), Data.SourceId, *List,
+				       ArrivalKindName(static_cast<uint8>(Winner.Kind)));
+			}
+		}
+	}
 
 	{
 		FWriteScopeLock Lock(RayData->Lock);
@@ -1070,7 +1407,7 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 			const float IndirectLoss = TotalLoss[SrcIdx].Bands[Band] / float(RayCount);
 			const float IndirectEnergy = 1.f - IndirectLoss;
 			const float DirectEnergy = FMath::Min(
-				Data.DirectTransmissionEnergy[Band] + Data.DirectDiffractionEnergy[Band], 1.f);
+				Data.DirectTransmissionEnergy[Band] + DiffractionEnergy[Band], 1.f);
 
 			const float FinalEnergy = DirectEnergy + (1.f - DirectEnergy) * IndirectEnergy;
 			const float NewEstimate = FMath::Clamp(1.f - FinalEnergy, 0.f, 1.f);
@@ -1084,9 +1421,47 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 			                                 ? FMath::Lerp(RayData->DirectLowpassCutoffHz, ValidData[SrcIdx].AirAbsorptionCutoffHz, OcclusionSmoothingAlpha)
 			                                 : ValidData[SrcIdx].AirAbsorptionCutoffHz;
 
+		const FVector TargetArrival = GRTAArrivalMode != 0 ? Winner.Direction : RawArrival;
+
+		float DirAlpha = OcclusionSmoothingAlpha;
+		if (GRTAArrivalMode != 0)
+		{
+			const bool bExactRoute = Winner.Kind == EArrivalKind::Direct || Winner.Kind == EArrivalKind::Through;
+			const bool bRouteSwitch = RayData->bHasLastWinner && Winner.Kind != EArrivalKind::Hold
+				&& FVector::DotProduct(Winner.Direction, RayData->LastWinnerDir)
+				   < FMath::Cos(FMath::DegreesToRadians(HysteresisMatchDeg));
+			if (bExactRoute || bRouteSwitch)
+			{
+				DirAlpha = FMath::Clamp(GRTAArrivalFastAlpha, OcclusionSmoothingAlpha, 1.f);
+			}
+		}
+
 		RayData->SmoothedArrival = RayData->bHasValidEstimate
-			                           ? FMath::Lerp(RayData->SmoothedArrival, RawArrival, OcclusionSmoothingAlpha)
-			                           : RawArrival;
+			                           ? FMath::Lerp(RayData->SmoothedArrival, TargetArrival, DirAlpha)
+			                           : TargetArrival;
+
+		RayData->SmoothedBlend = RayData->bHasValidEstimate
+			                         ? FMath::Lerp(RayData->SmoothedBlend, RawArrival, OcclusionSmoothingAlpha)
+			                         : RawArrival;
+
+		const bool bAnchoredRoute = GRTAArrivalMode != 0
+			&& Winner.Kind != EArrivalKind::Hold && Winner.Kind != EArrivalKind::Blend;
+		if (bAnchoredRoute)
+		{
+			const float AnchorAlpha = Winner.Kind == EArrivalKind::Direct || !RayData->bHasSmoothedAnchor ? 1.f : DirAlpha;
+			RayData->SmoothedAnchor = FMath::Lerp(RayData->SmoothedAnchor, Winner.Anchor, AnchorAlpha);
+			RayData->bHasSmoothedAnchor = true;
+		}
+		else if (GRTAArrivalMode == 0)
+		{
+			RayData->bHasSmoothedAnchor = false;
+		}
+
+		if (GRTAArrivalMode != 0 && Winner.Kind != EArrivalKind::Hold)
+		{
+			RayData->LastWinnerDir = Winner.Direction;
+			RayData->bHasLastWinner = true;
+		}
 
 		RayData->bHasValidEstimate = true;
 
@@ -1096,17 +1471,27 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 		}
 		Published.DirectLowpassCutoffHz = RayData->DirectLowpassCutoffHz;
 
-		const float Focus = RayData->SmoothedArrival.Size();
-		Published.ArrivalDirection = Focus > KINDA_SMALL_NUMBER
-			                             ? RayData->SmoothedArrival / Focus
+		const float DirLength = RayData->SmoothedArrival.Size();
+		Published.ArrivalDirection = DirLength > KINDA_SMALL_NUMBER
+			                             ? RayData->SmoothedArrival / DirLength
 			                             : DirToSource;
-		Published.ArrivalFocus = FMath::Clamp(Focus, 0.f, 1.f);
+		Published.ArrivalFocus = FMath::Clamp(static_cast<float>(RayData->SmoothedBlend.Size()), 0.f, 1.f);
 
 		Published.VirtualPosition = ListenerPos + Published.ArrivalDirection * SourceDistanceCm;
 
-		Published.bHasDetour = Data.bHasDetour;
-		Published.DetourPoint = Data.DetourPoint;
-		Published.DetourExcessCm = Data.DetourExcessCm;
+		if (GRTAArrivalMode != 0)
+		{
+			Published.bHasCorner = Winner.Kind == EArrivalKind::Corner;
+			Published.CornerPoint = Winner.Anchor;
+		}
+		else
+		{
+			Published.bHasCorner = DiffractionCorner != nullptr;
+			Published.CornerPoint = DiffractionCorner ? DiffractionCorner->Anchor : FVector::ZeroVector;
+		}
+		Published.ArrivalKind = static_cast<uint8>(Winner.Kind);
+		Published.bHasAnchor = GRTAArrivalMode != 0 && RayData->bHasSmoothedAnchor;
+		Published.ArrivalAnchor = RayData->SmoothedAnchor;
 
 		Published.bHasValidEstimate = true;
 	}
@@ -1116,7 +1501,7 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 	const float OffAxisDeg = FMath::RadiansToDegrees(FMath::Acos(
 		FMath::Clamp(FVector::DotProduct(Published.ArrivalDirection, DirToSource), -1.f, 1.f)));
 
-	UE_LOG(LogRTA, Verbose, TEXT("SourceId=%u Loss=[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f] CutoffHz=%.0f Arrival=(%.2f,%.2f,%.2f) OffAxis=%.0fdeg Focus=%.2f Detour=%d Excess=%.0fcm Diff=[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f]"),
+	UE_LOG(LogRTA, Verbose, TEXT("SourceId=%u Loss=[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f] CutoffHz=%.0f Arrival=(%.2f,%.2f,%.2f) OffAxis=%.0fdeg Focus=%.2f Corner=%d Excess=%.0fcm Diff=[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f]"),
 	       Data.SourceId,
 	       Published.DirectTransmissionLoss[0], Published.DirectTransmissionLoss[1],
 	       Published.DirectTransmissionLoss[2], Published.DirectTransmissionLoss[3],
@@ -1124,10 +1509,10 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 	       Published.DirectLowpassCutoffHz,
 	       Published.ArrivalDirection.X, Published.ArrivalDirection.Y, Published.ArrivalDirection.Z,
 	       OffAxisDeg, Published.ArrivalFocus,
-	       Data.bHasDetour ? 1 : 0, Data.DetourExcessCm,
-	       Data.DirectDiffractionEnergy[0], Data.DirectDiffractionEnergy[1],
-	       Data.DirectDiffractionEnergy[2], Data.DirectDiffractionEnergy[3],
-	       Data.DirectDiffractionEnergy[4], Data.DirectDiffractionEnergy[5]);
+	       DiffractionCorner ? 1 : 0, DiffractionExcessCm,
+	       DiffractionEnergy[0], DiffractionEnergy[1],
+	       DiffractionEnergy[2], DiffractionEnergy[3],
+	       DiffractionEnergy[4], DiffractionEnergy[5]);
 }
 
 bool FRaytraceManager::TickRoomProbe(float /*DeltaTime*/)

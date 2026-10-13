@@ -60,8 +60,7 @@ class FFeedbackDelayNetwork
 public:
 	void Init(float SampleRate);
 	void SetRT60(float Seconds);
-	/** High-frequency damping for a line of mean length (0 = none). Each line gets its own coefficient,
-	 *  scaled by its length, so every line loses high frequencies at the same rate per second. */
+
 	void SetDamping(float Amount);
 
 	/** Current damping target (mean-length reference), as derived by SetDecayFromBands. */
