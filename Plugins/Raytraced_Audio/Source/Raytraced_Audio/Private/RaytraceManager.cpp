@@ -72,7 +72,7 @@ namespace
 	static FAutoConsoleVariableRef CVarRTADebugDrawArrival(
 		TEXT("rta.DebugDrawArrival"), GRTADebugDrawArrival,
 		TEXT("Draw each source's true direction (red), apparent direction (green: thick up to the first wall, thin beyond it) ")
-		TEXT("and the corner the sound bends around (magenta)."),
+		TEXT("and the corner or door the sound comes from (magenta)."),
 		ECVF_Default);
 
 	static int32 GRTADebugDrawVirtualPosition = 0;
@@ -141,9 +141,38 @@ namespace
 		TEXT("route switches. Corner routes keep the normal smoothing, which hides their noise."),
 		ECVF_Default);
 
+	static int32 GRTARayTransmission = 1;
+	static FAutoConsoleVariableRef CVarRTARayTransmission(
+		TEXT("rta.RayTransmission"), GRTARayTransmission,
+		TEXT("1 = occlusion bounce rays can pass through surfaces with an acoustic material (doors, windows, thin walls), ")
+		TEXT("so routes through them are found anywhere, not only on the straight line. 0 = rays only reflect."),
+		ECVF_Default);
+
+	static float GRTARayTransmitMinDb = -40.f;
+	static FAutoConsoleVariableRef CVarRTARayTransmitMinDb(
+		TEXT("rta.RayTransmitMinDb"), GRTARayTransmitMinDb,
+		TEXT("Surfaces letting through at least this much (dB, mean over bands) pass at least rta.RayTransmitMinProb of ")
+		TEXT("the rays that hit them. The energy is reweighted, so the level stays correct; this only reduces noise."),
+		ECVF_Default);
+
+	static float GRTARayTransmitMinProb = 0.25f;
+	static FAutoConsoleVariableRef CVarRTARayTransmitMinProb(
+		TEXT("rta.RayTransmitMinProb"), GRTARayTransmitMinProb,
+		TEXT("Minimum chance a ray passes through a surface above rta.RayTransmitMinDb."),
+		ECVF_Default);
+
+	static float GRTADoorMaxSizeCm = 1000.f;
+	static FAutoConsoleVariableRef CVarRTADoorMaxSizeCm(
+		TEXT("rta.DoorMaxSizeCm"), GRTADoorMaxSizeCm,
+		TEXT("A transmissive surface no larger than this (cm) is treated as a door or window: the sound appears from its centre."),
+		ECVF_Default);
+
+	constexpr float MaxTransmitProb = 0.95f;
+	constexpr float SurfaceAnchorPullbackCm = 5.f;
+
 	constexpr int32 MaxTransmissionLayers = 4;
-	constexpr int32 CornerBisectSteps  = 8; 
-	constexpr float CandidateMergeDeg  = 5.f; 
+	constexpr int32 CornerBisectSteps  = 8;
+	constexpr float CandidateMergeDeg  = 5.f;
 	constexpr float HysteresisMatchDeg = 10.f;
 
 	const TCHAR* ArrivalKindName(uint8 Kind)
@@ -153,6 +182,7 @@ namespace
 		case FRaytraceManager::EArrivalKind::Direct:  return TEXT("direct");
 		case FRaytraceManager::EArrivalKind::Through: return TEXT("through");
 		case FRaytraceManager::EArrivalKind::Corner:  return TEXT("corner");
+		case FRaytraceManager::EArrivalKind::Surface: return TEXT("surface");
 		case FRaytraceManager::EArrivalKind::Blend:   return TEXT("blend");
 		case FRaytraceManager::EArrivalKind::Hold:    return TEXT("hold");
 		default:                                      return TEXT("?");
@@ -163,7 +193,7 @@ namespace
 	{
 		return GRTAPrecedenceMs > 0.f ? SpeedOfSoundMps * GRTAPrecedenceMs * 0.001f : 0.f;
 	}
-	
+
 	float PrecedenceWeight(float ExtraPathMetres, float WindowMetres)
 	{
 		if (WindowMetres <= 0.f) return 1.f;
@@ -460,9 +490,10 @@ void FRaytraceManager::DrawArrivalDebug() const
 		const FSourceResult& Result = Item.Value;
 		const float Distance = FVector::Dist(ListenerPos, EmitterPos);
 		const FVector Apparent = Origin + Result.ArrivalDirection * Distance;
-		
+
+		// Where the source really is
 		DrawDebugLine(DrawWorld, Origin, EmitterPos, FColor::Red, false, LifeTime, 0, 1.f);
-		
+
 		{
 			FCollisionQueryParams DebugParams;
 			DebugParams.bTraceComplex = true;
@@ -690,9 +721,7 @@ bool FRaytraceManager::GatherDirectData(const FVector& ListenerPos, const TArray
 				}
 
 				UPrimitiveComponent* HitComponent = LayerHit.GetComponent();
-				
 				if (!HitComponent) break;
-				
 				LayerParams.AddIgnoredComponent(HitComponent);
 
 				FHitResult NextHit;
@@ -706,7 +735,7 @@ bool FRaytraceManager::GatherDirectData(const FVector& ListenerPos, const TArray
 				{
 					for (int32 Band = 0; Band < RTA::NumBands; ++Band)
 					{
-						Entry.DirectTransmissionEnergy[Band] = 0.f;
+						Entry.DirectTransmissionEnergy[Band] = 0.f; 
 					}
 					break;
 				}
@@ -755,6 +784,7 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 		FVector Point;
 		float PathLengthCm;
 		float Energy[RTA::NumBands];
+		bool  bPassedSurface;
 	};
 	using FRayPath = TArray<FBounce, TInlineAllocator<16>>;
 
@@ -783,25 +813,89 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 			float PathLengthCm = 0.f;
 
 			FRayPath& Path = Paths[RayNum];
+			
+			FVector ForcedDir = FVector::ZeroVector;
+			bool bForceDir = false;
+			const UPrimitiveComponent* PassedThrough = nullptr;
+
+			const float TransmitFloor = FMath::Pow(10.f, GRTARayTransmitMinDb / 10.f);
+			bool bRayPassedSurface = false;
 
 			for (int32 Depth = 0; Depth < OcclusionMaxDepth; ++Depth)
 			{
-				const FVector RandomDir = SampleBounceDirection(
-					bHasHitSurface, SegmentStart, PreviousSegmentStart,
-					LastHitNormal, LastHitScattering, Rnd);
+				const FVector RandomDir = bForceDir
+					                          ? ForcedDir
+					                          : SampleBounceDirection(bHasHitSurface, SegmentStart, PreviousSegmentStart,
+					                                                  LastHitNormal, LastHitScattering, Rnd);
+				bForceDir = false;
 
 				FHitResult HitResult;
-				World->LineTraceSingleByChannel(HitResult, SegmentStart,
-				                                SegmentStart + RandomDir * RayLength, ECC_Visibility, BounceParams);
+				if (PassedThrough)
+				{
+					FCollisionQueryParams PastSurfaceParams = BounceParams;
+					PastSurfaceParams.AddIgnoredComponent(PassedThrough);
+					World->LineTraceSingleByChannel(HitResult, SegmentStart,
+					                                SegmentStart + RandomDir * RayLength, ECC_Visibility, PastSurfaceParams);
+					PassedThrough = nullptr;
+				}
+				else
+				{
+					World->LineTraceSingleByChannel(HitResult, SegmentStart,
+					                                SegmentStart + RandomDir * RayLength, ECC_Visibility, BounceParams);
+				}
 				if (!HitResult.IsValidBlockingHit())
 					break;
 
 				PathLengthCm += HitResult.Distance;
 
 				const FSurfaceAcoustics Surface = ResolveSurface(HitResult);
+				
+				UPrimitiveComponent* HitComponent = HitResult.GetComponent();
+				float MeanReflected = 0.f, MeanTransmitted = 0.f;
 				for (int32 Band = 0; Band < RTA::NumBands; ++Band)
 				{
-					RayEnergy[Band] *= Surface.Reflected[Band];
+					MeanReflected   += Surface.Reflected[Band];
+					MeanTransmitted += Surface.Transmitted[Band];
+				}
+				MeanReflected   /= static_cast<float>(RTA::NumBands);
+				MeanTransmitted /= static_cast<float>(RTA::NumBands);
+
+				bool bTransmit = false;
+				if (GRTARayTransmission != 0 && Surface.bHasMaterial && HitComponent
+					&& MeanTransmitted > 0.f && MeanReflected + MeanTransmitted > KINDA_SMALL_NUMBER)
+				{
+					float TransmitProb = MeanTransmitted / (MeanReflected + MeanTransmitted);
+					if (MeanTransmitted >= TransmitFloor)
+					{
+						TransmitProb = FMath::Max(TransmitProb, GRTARayTransmitMinProb);
+					}
+					TransmitProb = FMath::Clamp(TransmitProb, 0.f, MaxTransmitProb);
+
+					bTransmit = Rnd.FRand() < TransmitProb;
+					for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+					{
+						RayEnergy[Band] *= bTransmit
+							                   ? Surface.Transmitted[Band] / TransmitProb
+							                   : Surface.Reflected[Band] / (1.f - TransmitProb);
+					}
+				}
+				else
+				{
+					for (int32 Band = 0; Band < RTA::NumBands; ++Band)
+					{
+						RayEnergy[Band] *= Surface.Reflected[Band];
+					}
+				}
+
+				if (bTransmit)
+				{
+					PreviousSegmentStart = SegmentStart;
+					SegmentStart = FVector(HitResult.ImpactPoint) + RandomDir * SurfaceBiasCm;
+					ForcedDir = RandomDir;
+					bForceDir = true;
+					PassedThrough = HitComponent;
+					bRayPassedSurface = true;
+					continue;
 				}
 
 				PreviousSegmentStart = SegmentStart;
@@ -814,17 +908,21 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 				Bounce.Point = SegmentStart;
 				Bounce.PathLengthCm = PathLengthCm;
 				FMemory::Memcpy(Bounce.Energy, RayEnergy, sizeof(RayEnergy));
+				Bounce.bPassedSurface = bRayPassedSurface;
 			}
 		}, EParallelForFlags::BackgroundPriority);
 	}
-	
+
+	static constexpr int32 NumRouteClasses = 2;
 	struct FLobeBest
 	{
 		float Energy = 0.f;
-		float LengthCm = TNumericLimits<float>::Max();
+		float Score = -TNumericLimits<float>::Max();
+		float LengthCm = 0.f;
 		int32 RayNum = INDEX_NONE;
 		int32 BounceIdx = INDEX_NONE;
 	};
+	const int32 NumLobeSlots = NumArrivalLobes * NumRouteClasses;
 
 	struct FNeeContext
 	{
@@ -866,7 +964,7 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 		}
 
 		ParallelForWithTaskContext(Contexts, RayCount,
-		                           [&Paths, &ValidData, &IsBlocked, &ListenerPos, &StraightCm, NumSources, bSpreading, PrecedenceMetres]
+		                           [&Paths, &ValidData, &IsBlocked, &ListenerPos, &StraightCm, NumSources, NumLobeSlots, bSpreading, PrecedenceMetres]
 	                           (FNeeContext& Ctx, int32 RayNum)
 		                           {
 			                           if (!Ctx.bInitialised)
@@ -875,7 +973,7 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 				                           Ctx.ArrivalSum.Init(FVector::ZeroVector, NumSources);
 				                           Ctx.ArrivalEnergy.Init(0.f, NumSources);
 				                           Ctx.Connected.SetNumUninitialized(NumSources);
-				                           Ctx.Lobes.Init(FLobeBest(), NumSources * NumArrivalLobes);
+				                           Ctx.Lobes.Init(FLobeBest(), NumSources * NumLobeSlots);
 				                           Ctx.bInitialised = true;
 			                           }
 
@@ -926,10 +1024,13 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 				                           	
 					                           if (FirstLobe != INDEX_NONE)
 					                           {
-						                           FLobeBest& Lobe = Ctx.Lobes[SrcIdx * NumArrivalLobes + FirstLobe];
+						                           const int32 RouteClass = Bounce.bPassedSurface ? 1 : 0;
+						                           FLobeBest& Lobe = Ctx.Lobes[SrcIdx * NumLobeSlots + FirstLobe * NumRouteClasses + RouteClass];
 						                           Lobe.Energy += MeanArriving;
-						                           if (TotalPathCm < Lobe.LengthCm)
+						                           const float Score = RouteClass == 0 ? -TotalPathCm : MeanArriving;
+						                           if (Score > Lobe.Score)
 						                           {
+							                           Lobe.Score     = Score;
 							                           Lobe.LengthCm  = TotalPathCm;
 							                           Lobe.RayNum    = RayNum;
 							                           Lobe.BounceIdx = BounceIdx;
@@ -973,7 +1074,7 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 	if (GRTAArrivalMode != 0 || GRTADiffraction != 0)
 	{
 		TArray<FLobeBest> Merged;
-		Merged.Init(FLobeBest(), NumSources * NumArrivalLobes);
+		Merged.Init(FLobeBest(), NumSources * NumLobeSlots);
 		for (const FNeeContext& Ctx : Contexts)
 		{
 			if (!Ctx.bInitialised) continue;
@@ -982,8 +1083,9 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 				const FLobeBest& In = Ctx.Lobes[i];
 				FLobeBest& Out = Merged[i];
 				Out.Energy += In.Energy;
-				if (In.RayNum != INDEX_NONE && In.LengthCm < Out.LengthCm)
+				if (In.RayNum != INDEX_NONE && In.Score > Out.Score)
 				{
+					Out.Score     = In.Score;
 					Out.LengthCm  = In.LengthCm;
 					Out.RayNum    = In.RayNum;
 					Out.BounceIdx = In.BounceIdx;
@@ -991,25 +1093,26 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 			}
 		}
 
-		const int32 MaxCandidates = FMath::Clamp(GRTACornerCandidates, 0, NumArrivalLobes);
+		const int32 MaxCandidates = FMath::Clamp(GRTACornerCandidates, 0, NumLobeSlots);
 		for (int32 SrcIdx = 0; SrcIdx < NumSources; ++SrcIdx)
 		{
 			if (ValidData[SrcIdx].bDirectLOS || MaxCandidates == 0) continue;
-
-			TArray<int32, TInlineAllocator<NumArrivalLobes>> LobeOrder;
-			for (int32 Lobe = 0; Lobe < NumArrivalLobes; ++Lobe)
+			
+			TArray<int32, TInlineAllocator<NumArrivalLobes * 2>> SlotOrder;
+			for (int32 Slot = 0; Slot < NumLobeSlots; ++Slot)
 			{
-				const FLobeBest& L = Merged[SrcIdx * NumArrivalLobes + Lobe];
-				if (L.RayNum != INDEX_NONE && L.Energy > 0.f) LobeOrder.Add(Lobe);
+				const FLobeBest& L = Merged[SrcIdx * NumLobeSlots + Slot];
+				if (L.RayNum != INDEX_NONE && L.Energy > 0.f) SlotOrder.Add(Slot);
 			}
-			LobeOrder.Sort([&Merged, SrcIdx](int32 A, int32 B)
+			SlotOrder.Sort([&Merged, SrcIdx, NumLobeSlots](int32 A, int32 B)
 			{
-				return Merged[SrcIdx * NumArrivalLobes + A].Energy > Merged[SrcIdx * NumArrivalLobes + B].Energy;
+				return Merged[SrcIdx * NumLobeSlots + A].Energy > Merged[SrcIdx * NumLobeSlots + B].Energy;
 			});
 
-			for (int32 i = 0; i < FMath::Min(MaxCandidates, LobeOrder.Num()); ++i)
+			for (int32 i = 0; i < FMath::Min(MaxCandidates, SlotOrder.Num()); ++i)
 			{
-				const FLobeBest& L = Merged[SrcIdx * NumArrivalLobes + LobeOrder[i]];
+				const int32 Slot = SlotOrder[i];
+				const FLobeBest& L = Merged[SrcIdx * NumLobeSlots + Slot];
 				const FRayPath& Path = Paths[L.RayNum];
 
 				FCornerPath& Corner = OutCornerPaths[SrcIdx].AddDefaulted_GetRef();
@@ -1023,6 +1126,7 @@ void FRaytraceManager::BounceRaysTrace(const FVector& ListenerPos, const TArray<
 				Corner.Verts.Add(ValidData[SrcIdx].EmitterPos);
 				Corner.CumLengthCm.Add(L.LengthCm);
 				Corner.LobeEnergy = L.Energy;
+				Corner.bPassedSurface = (Slot % NumRouteClasses) == 1;
 			}
 		}
 	}
@@ -1090,6 +1194,8 @@ void FRaytraceManager::FindCorners(const FVector& ListenerPos, const TArray<TArr
 	JobBlocked.SetNum(Jobs.Num());
 	TArray<uint8> JobBisected;
 	JobBisected.Init(0, Jobs.Num());
+	TArray<int32> JobK;
+	JobK.Init(INDEX_NONE, Jobs.Num());
 
 	{
 		const FRTABatchedTracer Tracer(World.Get(), /*bTraceComplex*/ false);
@@ -1106,7 +1212,7 @@ void FRaytraceManager::FindCorners(const FVector& ListenerPos, const TArray<TArr
 			const FCornerPath& Path = CornerPaths[Jobs[JobIdx].SrcIdx][Jobs[JobIdx].PathIdx];
 			const int32 Last = Path.Verts.Num() - 1;
 			if (Last < 2) return;
-
+			
 			int32 K = 1;
 			for (int32 i = 2; i <= Last; ++i)
 			{
@@ -1132,7 +1238,7 @@ void FRaytraceManager::FindCorners(const FVector& ListenerPos, const TArray<TArr
 					if (!IsBlocked(ListenerPos, Mid)) Lo = Mid;
 					else                              Hi = Mid;
 				}
-				
+
 				const FVector& Emitter = Path.Verts[Last];
 				const double DistListener = FVector::Dist2D(ListenerPos, Lo);
 				const double DistEmitter  = FVector::Dist2D(Lo, Emitter);
@@ -1145,6 +1251,7 @@ void FRaytraceManager::FindCorners(const FVector& ListenerPos, const TArray<TArr
 				Out.Point = Lo;
 				JobBlocked[JobIdx] = Hi;
 				JobBisected[JobIdx] = 1;
+				JobK[JobIdx] = K;
 				
 				Out.LengthCm = FVector::Dist(ListenerPos, Lo)
 				             + FVector::Dist(Lo, Path.Verts[K + 1])
@@ -1174,9 +1281,47 @@ void FRaytraceManager::FindCorners(const FVector& ListenerPos, const TArray<TArr
 			FHitResult EdgeHit;
 			if (World->LineTraceSingleByChannel(EdgeHit, ListenerPos, JobBlocked[JobIdx], ECC_Visibility, AnchorParams))
 			{
-				const double MaxT = FVector::Dist(ListenerPos, Out.Point);
-				const double T = FVector::DotProduct(FVector(EdgeHit.ImpactPoint) - ListenerPos, Out.Direction);
-				Out.Anchor = ListenerPos + Out.Direction * FMath::Clamp(T, FMath::Min(MinAnchorDistanceCm, MaxT), MaxT);
+				const FCornerPath& Path = CornerPaths[Jobs[JobIdx].SrcIdx][Jobs[JobIdx].PathIdx];
+				const int32 K = JobK[JobIdx];
+				UPrimitiveComponent* EdgeComponent = EdgeHit.GetComponent();
+
+				bool bThroughSurface = false;
+				if (GRTARayTransmission != 0 && Path.bPassedSurface && EdgeComponent && K != INDEX_NONE)
+				{
+					FHitResult SegmentHit;
+					bThroughSurface = World->LineTraceSingleByChannel(SegmentHit, Path.Verts[K], Path.Verts[K + 1],
+					                                                  ECC_Visibility, AnchorParams)
+						&& SegmentHit.GetComponent() == EdgeComponent;
+				}
+
+				if (bThroughSurface)
+				{
+					FVector Anchor = FVector(EdgeHit.ImpactPoint) - Out.Direction * SurfaceAnchorPullbackCm;
+					const FBoxSphereBounds& Bounds = EdgeComponent->Bounds;
+					if (Bounds.BoxExtent.GetMax() * 2.0 <= GRTADoorMaxSizeCm)
+					{
+						FCollisionQueryParams CentreParams = AnchorParams;
+						CentreParams.AddIgnoredComponent(EdgeComponent);
+						if (!World->LineTraceTestByChannel(ListenerPos, Bounds.Origin, ECC_Visibility, CentreParams))
+						{
+							Anchor = Bounds.Origin;
+						}
+					}
+
+					const FVector ToAnchor = Anchor - ListenerPos;
+					if (ToAnchor.SizeSquared() > 1.0)
+					{
+						Out.Kind = EArrivalKind::Surface;
+						Out.Anchor = Anchor;
+						Out.Direction = ToAnchor.GetUnsafeNormal();
+					}
+				}
+				else
+				{
+					const double MaxT = FVector::Dist(ListenerPos, Out.Point);
+					const double T = FVector::DotProduct(FVector(EdgeHit.ImpactPoint) - ListenerPos, Out.Direction);
+					Out.Anchor = ListenerPos + Out.Direction * FMath::Clamp(T, FMath::Min(MinAnchorDistanceCm, MaxT), MaxT);
+				}
 			}
 		}
 
@@ -1220,7 +1365,7 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 	};
 	auto IsRealCorner = [&Data](const FArrivalCandidate& C)
 	{
-		return FVector::DistSquared(C.Point, Data.EmitterPos) > 1.0;
+		return C.Kind == EArrivalKind::Corner && FVector::DistSquared(C.Point, Data.EmitterPos) > 1.0;
 	};
 
 	float DiffractionEnergy[RTA::NumBands] = {};
@@ -1322,7 +1467,7 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 			}
 
 			const float MergeCos = FMath::Cos(FMath::DegreesToRadians(CandidateMergeDeg));
-
+			
 			const float IndirectScale = (1.f - MeanDirect) / static_cast<float>(RayCount);
 			for (const FArrivalCandidate& Corner : CornerCandidates[SrcIdx])
 			{
@@ -1338,7 +1483,7 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 
 				if (C.Weight > 0.f) Candidates.Add(C);
 			}
-
+			
 			for (int32 i = 0; i < Candidates.Num(); ++i)
 			{
 				for (int32 j = Candidates.Num() - 1; j > i; --j)
@@ -1420,9 +1565,9 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 		RayData->DirectLowpassCutoffHz = RayData->bHasValidEstimate
 			                                 ? FMath::Lerp(RayData->DirectLowpassCutoffHz, ValidData[SrcIdx].AirAbsorptionCutoffHz, OcclusionSmoothingAlpha)
 			                                 : ValidData[SrcIdx].AirAbsorptionCutoffHz;
-
+		
 		const FVector TargetArrival = GRTAArrivalMode != 0 ? Winner.Direction : RawArrival;
-
+		
 		float DirAlpha = OcclusionSmoothingAlpha;
 		if (GRTAArrivalMode != 0)
 		{
@@ -1443,7 +1588,7 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 		RayData->SmoothedBlend = RayData->bHasValidEstimate
 			                         ? FMath::Lerp(RayData->SmoothedBlend, RawArrival, OcclusionSmoothingAlpha)
 			                         : RawArrival;
-
+		
 		const bool bAnchoredRoute = GRTAArrivalMode != 0
 			&& Winner.Kind != EArrivalKind::Hold && Winner.Kind != EArrivalKind::Blend;
 		if (bAnchoredRoute)
@@ -1478,10 +1623,10 @@ void FRaytraceManager::TraceWriteBack(const FVector& ListenerPos, const TArray<F
 		Published.ArrivalFocus = FMath::Clamp(static_cast<float>(RayData->SmoothedBlend.Size()), 0.f, 1.f);
 
 		Published.VirtualPosition = ListenerPos + Published.ArrivalDirection * SourceDistanceCm;
-
+		
 		if (GRTAArrivalMode != 0)
 		{
-			Published.bHasCorner = Winner.Kind == EArrivalKind::Corner;
+			Published.bHasCorner = Winner.Kind == EArrivalKind::Corner || Winner.Kind == EArrivalKind::Surface;
 			Published.CornerPoint = Winner.Anchor;
 		}
 		else
@@ -2136,9 +2281,11 @@ FRaytraceManager::FSurfaceAcoustics FRaytraceManager::ResolveSurface(const FHitR
 		for (int32 Band = 0; Band < RTA::NumBands; ++Band)
 		{
 			Out.Absorption[Band] = FMath::Clamp(Absorption[Band], 0.f, 1.f);
+			Out.Transmitted[Band] = FMath::Clamp(Transmission[Band], 0.f, 1.f);
 			Out.Reflected[Band] = FMath::Clamp(1.f - Absorption[Band] - Transmission[Band], 0.f, 1.f);
 		}
 		Out.Scattering = Mat->GetBakedScattering();
+		Out.bHasMaterial = true;
 	}
 	else
 	{

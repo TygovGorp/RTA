@@ -18,7 +18,7 @@ class FRaytraceManager : public TSharedFromThis<FRaytraceManager>
 public:
 	struct FSourceResult
 	{
-		float DirectTransmissionLoss[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f }; // 0 = audible, 1 = blocked
+		float DirectTransmissionLoss[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
 		float DirectLowpassCutoffHz = 20000.f;
 		FVector ArrivalDirection = FVector::ForwardVector;
 		FVector VirtualPosition = FVector::ZeroVector;
@@ -114,17 +114,18 @@ public:
 		float   Energy = 0.f;
 	};
 	
-	enum class EArrivalKind : uint8 { Direct, Through, Corner, Blend, Hold };
+	enum class EArrivalKind : uint8 { Direct, Through, Corner, Surface, Blend, Hold };
 
 	static constexpr int32 NumArrivalLobes = 27;
-
+	
 	struct FCornerPath
 	{
 		TArray<FVector, TInlineAllocator<10>> Verts;
 		TArray<float,   TInlineAllocator<10>> CumLengthCm;
 		float LobeEnergy = 0.f;
+		bool  bPassedSurface = false;
 	};
-
+	
 	struct FArrivalCandidate
 	{
 		EArrivalKind Kind = EArrivalKind::Corner;
@@ -139,7 +140,9 @@ public:
 	{
 		float Reflected[RTA::NumBands] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
 		float Absorption[RTA::NumBands] = {};
+		float Transmitted[RTA::NumBands] = {};
 		float Scattering = RTA::DefaultScattering;
+		bool  bHasMaterial = false;
 	};
 	
 	FRaytraceManager();
