@@ -3,6 +3,7 @@
 #include "RTAOcclusionSourceSettings.h"
 #include "RTAReverbSourceSettings.h"
 #include "RTASourceDataOverrideSettings.h"
+#include "RTASpatializationSourceSettings.h"
 
 #define LOCTEXT_NAMESPACE "RTAAssetDefinitions"
 
@@ -64,6 +65,27 @@ TSoftClassPtr<UObject> UAssetDefinition_RTASourceDataOverrideSettings::GetAssetC
 }
 
 TConstArrayView<FAssetCategoryPath> UAssetDefinition_RTASourceDataOverrideSettings::GetAssetCategories() const
+{
+	static const auto Categories = { EAssetCategoryPaths::Audio };
+	return Categories;
+}
+
+FText UAssetDefinition_RTASpatializationSourceSettings::GetAssetDisplayName() const
+{
+	return LOCTEXT("RTASpatializationSourceSettings", "Raytraced Spatialization Settings");
+}
+
+FLinearColor UAssetDefinition_RTASpatializationSourceSettings::GetAssetColor() const
+{
+	return FLinearColor(FColor(97, 85, 212));
+}
+
+TSoftClassPtr<UObject> UAssetDefinition_RTASpatializationSourceSettings::GetAssetClass() const
+{
+	return URTASpatializationSourceSettings::StaticClass();
+}
+
+TConstArrayView<FAssetCategoryPath> UAssetDefinition_RTASpatializationSourceSettings::GetAssetCategories() const
 {
 	static const auto Categories = { EAssetCategoryPaths::Audio };
 	return Categories;

@@ -1,19 +1,27 @@
 ﻿#pragma once
 #include "AudioDevice.h"
 #include "RaytraceManager.h"
-#include "RTAOcclusionSourceSettings.h"
+#include "RTASpatializationSourceSettings.h"
 
 class FRaytracedSpatializationFactory : public IAudioSpatializationFactory
 {
 public:
-		virtual FString GetDisplayName() override { return TEXT("RaytracedOcclusion"); }
-	virtual bool SupportsPlatform(const FString& PlatformName) override { return true; }
-	virtual TAudioOcclusionPtr CreateNewOcclusionPlugin(FAudioDevice* OwningDevice) override;
-	
-	virtual UClass* GetCustomOcclusionSettingsClass() const override
+
+	virtual UClass* GetCustomSpatializationSettingsClass() const override
 	{
-		return URTAOcclusionSourceSettings::StaticClass();
+		return URTASpatializationSourceSettings::StaticClass();
 	}
+	virtual FString GetDisplayName() override { return TEXT("RaytracedSpatialization"); }
+	
+	virtual int32 GetMaxSupportedChannels() override
+	{
+		return 2;
+	}
+	
+	virtual bool SupportsPlatform(const FString& PlatformName) override { return true; }
+	
+	virtual TAudioSpatializationPtr CreateNewSpatializationPlugin(FAudioDevice* OwningDevice) override;
+	
 	
 	void SetAudioPluginListenerPtr(TAudioPluginListenerPtr Ptr) { AudioPluginListenerPtr = Ptr; }
 	void SetRTManagerMapPtr(TMap<FAudioDevice*, TSharedPtr<FRaytraceManager>>* Ptr) { RTManagerMapPtr = Ptr; }

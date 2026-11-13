@@ -17,6 +17,9 @@ void FRaytracedAudioModule::StartupModule()
 
 	AudioPluginListener = MakeShared<FAudioPluginListener>();
 	AudioPluginListener->SetRTManagerMapPtr(&RTManagerMap);
+	
+	SpatializationFactory.SetRTManagerMapPtr(&RTManagerMap);
+	SpatializationFactory.SetAudioPluginListenerPtr(AudioPluginListener);
 
 	OcclusionFactory.SetRTManagerMapPtr(&RTManagerMap);
 	OcclusionFactory.SetAudioPluginListenerPtr(AudioPluginListener);
@@ -26,6 +29,8 @@ void FRaytracedAudioModule::StartupModule()
 
 	SourceDataOverrideFactory.SetRTManagerMapPtr(&RTManagerMap);
 
+	IModularFeatures::Get().RegisterModularFeature(
+	IAudioSpatializationFactory::GetModularFeatureName(), &SpatializationFactory);
 	IModularFeatures::Get().RegisterModularFeature(
 		IAudioOcclusionFactory::GetModularFeatureName(), &OcclusionFactory);
 	IModularFeatures::Get().RegisterModularFeature(
@@ -200,6 +205,8 @@ void FRaytracedAudioModule::ShutdownModule()
 	WorldInitializedActorsHandle.Reset();
 	WorldBeginTearDownHandle.Reset();
 
+	IModularFeatures::Get().UnregisterModularFeature(
+		IAudioSpatializationFactory::GetModularFeatureName(), &SpatializationFactory);
 	IModularFeatures::Get().UnregisterModularFeature(
 		IAudioOcclusionFactory::GetModularFeatureName(), &OcclusionFactory);
 	IModularFeatures::Get().UnregisterModularFeature(

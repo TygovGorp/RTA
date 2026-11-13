@@ -3,6 +3,7 @@ DerivedDataCache
 Intermediate
 Saved
 Build/Windows/FileOpenOrder/
+Plugins\Raytraced_Audio\Content\Demo\General\Audio\Spatialization\HRTF\*.bin
 .vscode
 .vs
 .idea/

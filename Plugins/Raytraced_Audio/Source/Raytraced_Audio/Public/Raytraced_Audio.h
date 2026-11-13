@@ -7,6 +7,7 @@
 #include "RaytraceManager.h"
 #include "ReverbFactory.h"
 #include "SourceDataOverrideFactory.h"
+#include "SpatializationFactory.h"
 
 class FRaytracedAudioModule : public IModuleInterface
 {
@@ -20,6 +21,7 @@ private:
 	TMap<FAudioDevice*, TSharedPtr<FRaytraceManager>> RTManagerMap;
 
 	TSharedPtr<FAudioPluginListener> AudioPluginListener;
+	FRaytracedSpatializationFactory SpatializationFactory;
 	FRaytracedOcclusionFactory OcclusionFactory;
 	FRaytracedReverbFactory ReverbFactory;
 	FRaytracedSourceDataOverrideFactory SourceDataOverrideFactory;

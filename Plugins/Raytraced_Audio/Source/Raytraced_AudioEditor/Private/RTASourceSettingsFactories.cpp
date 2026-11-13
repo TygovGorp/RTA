@@ -4,6 +4,7 @@
 #include "RTAOcclusionSourceSettings.h"
 #include "RTAReverbSourceSettings.h"
 #include "RTASourceDataOverrideSettings.h"
+#include "RTASpatializationSourceSettings.h"
 
 URTAOcclusionSourceSettingsFactory::URTAOcclusionSourceSettingsFactory()
 {
@@ -39,6 +40,24 @@ UObject* URTAReverbSourceSettingsFactory::FactoryCreateNew(
 }
 
 uint32 URTAReverbSourceSettingsFactory::GetMenuCategories() const
+{
+	return EAssetTypeCategories::Sounds;
+}
+
+URTASpatializationSourceSettingsFactory::URTASpatializationSourceSettingsFactory()
+{
+	SupportedClass = URTASpatializationSourceSettings::StaticClass();
+	bCreateNew = true;
+	bEditAfterNew = true;
+}
+
+UObject* URTASpatializationSourceSettingsFactory::FactoryCreateNew(UClass* InClass, UObject* InParent, FName InName,
+	EObjectFlags Flags, UObject* Context, FFeedbackContext* Warn)
+{
+	return NewObject<URTASpatializationSourceSettings>(InParent, InName, Flags);
+}
+
+uint32 URTASpatializationSourceSettingsFactory::GetMenuCategories() const
 {
 	return EAssetTypeCategories::Sounds;
 }
