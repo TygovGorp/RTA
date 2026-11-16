@@ -49,6 +49,26 @@ private:
 	void Reset();
 };
 
+namespace RTA::HeadModel
+{
+	constexpr int32 DelaySize      = 64;        // power of two, > max ITD (~33 samples) + 1
+	constexpr float HeadRadius     = 0.09f;     // metres, matches the RIEC data
+	constexpr float SpeedOfSound   = 343.f;     // metres per second
+	constexpr float AlphaMin       = 0.1f;
+	constexpr float HeadModelGain  = 0.7071f;   // match equal-power panning's centre level
+
+	struct FShadowFilterState { float X1 = 0.f; float Y1 = 0.f; };
+
+	struct FState
+	{
+		float Buffer[DelaySize] = {};           // fixed size: no heap, reset by assignment
+		int32 WritePos = 0;
+		float PrevDelayL = 0.f;
+		float PrevDelayR = 0.f;
+		FShadowFilterState ShadowL, ShadowR;
+	};
+}
+
 class FRaytracedSpatialization : public IAudioSpatialization
 {
 public:
@@ -91,6 +111,11 @@ public:
 
 	TSharedPtr<FRaytraceManager> RTManager;
 private:
+	void ProcessHeadModel(RTA::HeadModel::FState& State, const float* In, float* OutInterleaved,
+						  int32 NumFrames, const FVector3f& Dir) const;
+
+	TArray<RTA::HeadModel::FState> HeadModelStates;   // indexed by SourceId, sized in Initialize
+	
 	bool bInitialized = false;
 	
 	int32 SampleRate = 0;

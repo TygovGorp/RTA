@@ -15,6 +15,59 @@ namespace
 		const float CosEl = FMath::Cos(El);
 		return FVector3f(CosEl * FMath::Cos(Az), -CosEl * FMath::Sin(Az), FMath::Sin(El));
 	}
+	
+	using namespace RTA::HeadModel;
+
+	enum class EEar { Left, Right };
+
+	struct FShadowCoeffs { float B0, B1, A1; };
+
+	float LateralAngle(const FVector3f& Dir)
+	{
+		if (Dir.IsNearlyZero()) return 0.f;
+		return FMath::Asin(FMath::Clamp(Dir.Y, -1.f, 1.f));
+	}
+
+	float WoodworthITD(float Theta)
+	{
+		const float T = FMath::Abs(Theta);
+		return (HeadRadius / SpeedOfSound) * (T + FMath::Sin(T));
+	}
+
+	float ReadDelayed(const float* Buffer, int32 WritePos, float Delay)
+	{
+		const float ReadPos = WritePos - Delay;
+		const int32 I = FMath::FloorToInt32(ReadPos);
+		const float Frac = ReadPos - I;
+		const float Older = Buffer[I & (DelaySize - 1)];          // negative I wraps correctly
+		const float Newer = Buffer[(I + 1) & (DelaySize - 1)];
+		return Older + Frac * (Newer - Older);
+	}
+
+	float ShadowAlpha(float Theta, EEar Ear)
+	{
+		const float S = FMath::Sin(Theta);
+		return FMath::Max(Ear == EEar::Left ? 1.f - S : 1.f + S, AlphaMin);
+	}
+
+	FShadowCoeffs ShadowCoefficients(float Alpha, float SampleRate)
+	{
+		const float Beta = 2.f * SpeedOfSound / HeadRadius;
+		const float K = 2.f * SampleRate;
+		return { (Beta + Alpha * K) / (Beta + K),
+				 (Beta - Alpha * K) / (Beta + K),
+				 (Beta - K)         / (Beta + K) };
+	}
+
+	float ShadowProcess(FShadowFilterState& S, float X, const FShadowCoeffs& C)
+	{
+		const float Y = C.B0 * X + C.B1 * S.X1 - C.A1 * S.Y1;
+		S.X1 = X;
+		S.Y1 = Y;
+		return Y;
+	}
+	
+
 }
 
 void FRTAHRIRSet::Reset()
@@ -94,17 +147,19 @@ bool FRTAHRIRSet::Load(const FString& Path)
 
 void FRaytracedSpatialization::Initialize(const FAudioPluginInitializationParams InitializationParams)
 {
-	//TODO
-	SampleRate =InitializationParams.SampleRate;
+	SampleRate   = InitializationParams.SampleRate;
 	BufferLength = InitializationParams.BufferLength;
-	NumSources = InitializationParams.NumSources;
-	
-	PerSourceStates.Reserve(NumSources);
-	
-	HRIRSet.Load(TEXT("C:/Code/Git/RTA/Plugins/Raytraced_Audio/Content/Demo/General/Audio/Spatialization/HRTF/riec_080.bin"));
-	
-	UE_LOG(LogRTA, Log, TEXT("Spatialization initialised"));
+	NumSources   = InitializationParams.NumSources;
+
+	HeadModelStates.SetNum(NumSources);
+
+	if (!HRIRSet.Load(TEXT("C:/Code/Git/RTA/Plugins/Raytraced_Audio/Content/Demo/General/Audio/Spatialization/HRTF/riec_080.bin")))
+	{
+		UE_LOG(LogRTA, Warning, TEXT("Spatialization: no HRTF loaded, HRTF mode unavailable"));
+	}
+
 	bInitialized = true;
+	UE_LOG(LogRTA, Log, TEXT("Spatialization initialised"));
 }
 
 bool FRaytracedSpatialization::CreateSpatializationEffect(uint32 SourceId)
@@ -115,10 +170,11 @@ bool FRaytracedSpatialization::CreateSpatializationEffect(uint32 SourceId)
 
 void FRaytracedSpatialization::OnInitSource(const uint32 SourceId, const FName& AudioComponentUserId,
 	const uint32 NumChannels, USpatializationPluginSourceSettingsBase* InSettings)
-
 {
-	//TODO
-	UE_LOG(LogRTA, Log, TEXT("Spatialization New Source Initialised"));
+	if (HeadModelStates.IsValidIndex(SourceId))
+	{
+		HeadModelStates[SourceId] = RTA::HeadModel::FState(); // no leftover tail from the previous sound
+	}
 }
 
 void FRaytracedSpatialization::OnReleaseSource(const uint32 SourceId)
@@ -129,15 +185,23 @@ void FRaytracedSpatialization::OnReleaseSource(const uint32 SourceId)
 void FRaytracedSpatialization::ProcessAudio(const FAudioPluginSourceInputData& InputData,
 	FAudioPluginSourceOutputData& OutputData)
 {
-	auto EmmitterDir = InputData.SpatializationParams->EmitterPosition;
-	EmmitterDir.Normalize();
-	
-	const auto Rot = EmmitterDir.Rotation();
-	
-	const auto AzimuthDeg= Rot.Yaw;
-	const auto ElevationDeg = Rot.Pitch;
-	
-	OutputData.AudioBuffer = *InputData.AudioBuffer;
+	const float* In = InputData.AudioBuffer->GetData();
+	float* Out = OutputData.AudioBuffer.GetData();
+	const int32 NumFrames = InputData.AudioBuffer->Num(); // mono in: one sample per frame
+
+	if (OutputData.AudioBuffer.Num() != 2 * NumFrames || !HeadModelStates.IsValidIndex(InputData.SourceId))
+	{
+		// Unexpected layout or unknown source: pass through rather than write out of bounds.
+		const int32 Frames = FMath::Min(NumFrames, OutputData.AudioBuffer.Num() / 2);
+		for (int32 n = 0; n < Frames; ++n)
+		{
+			Out[2 * n] = Out[2 * n + 1] = In[n];
+		}
+		return;
+	}
+
+	const FVector3f Dir = FVector3f(InputData.SpatializationParams->EmitterPosition).GetSafeNormal();
+	ProcessHeadModel(HeadModelStates[InputData.SourceId], In, Out, NumFrames, Dir);
 }
 
 void FRaytracedSpatialization::OnAllSourcesProcessed()
@@ -164,4 +228,35 @@ void* FRaytracedSpatialization::GetSpatializationEffect(uint32 SourceId)
 bool FRaytracedSpatialization::IsSpatializationEffectInitialized() const
 {
 	return bInitialized;
+}
+
+void FRaytracedSpatialization::ProcessHeadModel(RTA::HeadModel::FState& State, const float* In,
+	float* OutInterleaved, int32 NumFrames, const FVector3f& Dir) const
+{
+	const float Theta = LateralAngle(Dir);
+	const float ItdSamples = WoodworthITD(Theta) * SampleRate;
+	const float TargetDelayL = Theta > 0.f ? ItdSamples : 0.f;   // source right → left ear is far
+	const float TargetDelayR = Theta > 0.f ? 0.f : ItdSamples;
+
+	const FShadowCoeffs CoeffsL = ShadowCoefficients(ShadowAlpha(Theta, EEar::Left),  SampleRate);
+	const FShadowCoeffs CoeffsR = ShadowCoefficients(ShadowAlpha(Theta, EEar::Right), SampleRate);
+
+	for (int32 n = 0; n < NumFrames; ++n)
+	{
+		State.WritePos = (State.WritePos + 1) & (DelaySize - 1);
+		State.Buffer[State.WritePos] = In[n];
+
+		const float T = float(n + 1) / float(NumFrames);       // ramp delays across the block
+		const float DelayL = FMath::Lerp(State.PrevDelayL, TargetDelayL, T);
+		const float DelayR = FMath::Lerp(State.PrevDelayR, TargetDelayR, T);
+
+		const float Left  = ReadDelayed(State.Buffer, State.WritePos, DelayL);
+		const float Right = ReadDelayed(State.Buffer, State.WritePos, DelayR);
+
+		OutInterleaved[2 * n]     = ShadowProcess(State.ShadowL, Left,  CoeffsL) * HeadModelGain;
+		OutInterleaved[2 * n + 1] = ShadowProcess(State.ShadowR, Right, CoeffsR) * HeadModelGain;
+	}
+
+	State.PrevDelayL = TargetDelayL;
+	State.PrevDelayR = TargetDelayR;
 }
