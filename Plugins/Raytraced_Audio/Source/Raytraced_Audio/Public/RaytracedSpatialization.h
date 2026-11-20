@@ -115,6 +115,7 @@ private:
 						  int32 NumFrames, const FVector3f& Dir) const;
 
 	TArray<RTA::HeadModel::FState> HeadModelStates;   // indexed by SourceId, sized in Initialize
+	TArray<float> MonoScratch;	// NumSources * BufferLength, one slice per source
 	
 	bool bInitialized = false;
 	

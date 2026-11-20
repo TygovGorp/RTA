@@ -152,6 +152,7 @@ void FRaytracedSpatialization::Initialize(const FAudioPluginInitializationParams
 	NumSources   = InitializationParams.NumSources;
 
 	HeadModelStates.SetNum(NumSources);
+	MonoScratch.SetNumZeroed(NumSources * BufferLength);
 
 	if (!HRIRSet.Load(TEXT("C:/Code/Git/RTA/Plugins/Raytraced_Audio/Content/Demo/General/Audio/Spatialization/HRTF/riec_080.bin")))
 	{
@@ -187,21 +188,43 @@ void FRaytracedSpatialization::ProcessAudio(const FAudioPluginSourceInputData& I
 {
 	const float* In = InputData.AudioBuffer->GetData();
 	float* Out = OutputData.AudioBuffer.GetData();
-	const int32 NumFrames = InputData.AudioBuffer->Num(); // mono in: one sample per frame
+	const int32 NumChannels = InputData.NumChannels;
+	const int32 NumFrames = NumChannels > 0 ? InputData.AudioBuffer->Num() / NumChannels : 0;
+	const int32 SourceId = InputData.SourceId;
 
-	if (OutputData.AudioBuffer.Num() != 2 * NumFrames || !HeadModelStates.IsValidIndex(InputData.SourceId))
+	const bool bValid = (NumChannels == 1 || NumChannels == 2)
+		&& OutputData.AudioBuffer.Num() == 2 * NumFrames
+		&& NumFrames <= BufferLength
+		&& HeadModelStates.IsValidIndex(SourceId);
+
+	if (!bValid)
 	{
-		// Unexpected layout or unknown source: pass through rather than write out of bounds.
-		const int32 Frames = FMath::Min(NumFrames, OutputData.AudioBuffer.Num() / 2);
-		for (int32 n = 0; n < Frames; ++n)
+		// Unexpected layout: pass through stereo as-is, duplicate mono, never write out of bounds.
+		if (NumChannels == 2 && InputData.AudioBuffer->Num() == OutputData.AudioBuffer.Num())
 		{
-			Out[2 * n] = Out[2 * n + 1] = In[n];
+			FMemory::Memcpy(Out, In, OutputData.AudioBuffer.Num() * sizeof(float));
+		}
+		else if (NumChannels == 1)
+		{
+			const int32 Frames = FMath::Min(NumFrames, OutputData.AudioBuffer.Num() / 2);
+			for (int32 n = 0; n < Frames; ++n) { Out[2 * n] = Out[2 * n + 1] = In[n]; }
 		}
 		return;
 	}
 
+	const float* Mono = In;
+	if (NumChannels == 2)
+	{
+		float* Scratch = MonoScratch.GetData() + SourceId * BufferLength;
+		for (int32 n = 0; n < NumFrames; ++n)
+		{
+			Scratch[n] = 0.5f * (In[2 * n] + In[2 * n + 1]);
+		}
+		Mono = Scratch;
+	}
+
 	const FVector3f Dir = FVector3f(InputData.SpatializationParams->EmitterPosition).GetSafeNormal();
-	ProcessHeadModel(HeadModelStates[InputData.SourceId], In, Out, NumFrames, Dir);
+	ProcessHeadModel(HeadModelStates[SourceId], Mono, Out, NumFrames, Dir);
 }
 
 void FRaytracedSpatialization::OnAllSourcesProcessed()
